@@ -7,9 +7,10 @@
  * system in the path. The oracle is the sync-read pattern file: FIEMAP on
  * the mounted XFS gives the device byte offset of each of its extents, and
  * a raw read at that offset must return the same bytes the kernel wrote
- * there. The write leg overwrites one page of that file's own extent
- * through the raw handle, reads it back, then restores the pattern, so the
- * file system and the page cache end the test consistent with the disk.
+ * there. The write legs (sync and stream-ordered) overwrite one page of that
+ * file's own extent through the raw handle, read it back, then restore the
+ * pattern, so the file system and the page cache end the test consistent
+ * with the disk.
  *
  * Also checks the gate: with OPENDS_AISIO_RAW_BLOCK unset a block device fd
  * is refused at registration.
@@ -296,6 +297,72 @@ main(int argc, char **argv)
 			fprintf(stderr, "pattern restored ok\n");
 		free(inv);
 	}
+
+	/* ---- 6b. Stream-ordered raw I/O on the first extent: a stream read
+	 * of the whole extent, then a stream write of one page followed on the
+	 * same stream by a read of it, waited for once. ---- */
+	{
+		CUstream stream;
+		if (cuStreamCreate(&stream, CU_STREAM_NON_BLOCKING) !=
+		            CUDA_SUCCESS ||
+		    opends_stream_register(stream, 0).err != OPENDS_SUCCESS) {
+			fprintf(stderr, "stream setup failed\n");
+			failed++;
+			goto stream_done;
+		}
+
+		ssize_t r = raw_stream_read(raw_fh, stream, gpu, host,
+		                            ext[0].len, ext[0].dev_off);
+		size_t bad = r == (ssize_t)ext[0].len
+		                     ? check_pattern(host, ext[0].file_off,
+		                                     ext[0].len)
+		                     : ext[0].len;
+		if (bad) {
+			fprintf(stderr,
+			        "stream raw read: returned %zd, %zu bad "
+			        "bytes\n",
+			        r, bad);
+			failed++;
+		} else {
+			fprintf(stderr, "stream raw read ok\n");
+		}
+
+		unsigned char *inv = malloc(PAGE);
+		for (size_t i = 0; i < PAGE; i++)
+			inv[i] = (unsigned char)~pattern_byte(
+			        (off_t)(ext[0].file_off + i));
+		cuda_buf_from_host(gpu, inv, PAGE);
+		cuda_buf_zero((uint8_t *)gpu + PAGE, PAGE);
+		size_t wsz = PAGE, rsz = PAGE;
+		off_t wfo = (off_t)ext[0].dev_off, rfo = wfo;
+		off_t wbo = 0, rbo = PAGE;
+		ssize_t wb = -1, rb = -1;
+		opends_error_t werr = opends_stream_write(
+		        raw_fh, gpu, &wsz, &wfo, &wbo, &wb, stream);
+		opends_error_t rerr = opends_stream_read(
+		        raw_fh, gpu, &rsz, &rfo, &rbo, &rb, stream);
+		int waited = raw_stream_wait(stream, 10.0, "stream write+read");
+		cuda_buf_to_host(host, (uint8_t *)gpu + PAGE, PAGE);
+		if (werr.err != OPENDS_SUCCESS || rerr.err != OPENDS_SUCCESS ||
+		    waited < 0 || wb != PAGE || rb != PAGE ||
+		    memcmp(host, inv, PAGE) != 0) {
+			fprintf(stderr,
+			        "stream raw write then read: submit %d/%d, "
+			        "wrote %zd, read %zd\n",
+			        werr.err, rerr.err, wb, rb);
+			failed++;
+		} else {
+			fprintf(stderr,
+			        "stream raw write + in-order read ok\n");
+		}
+		free(inv);
+
+		if (restore_page(raw_fh, gpu, host, &ext[0]) < 0)
+			failed++;
+		opends_stream_deregister(stream);
+		cuStreamDestroy(stream);
+	}
+stream_done:
 
 	/* ---- 7. Unaligned raw writes are refused, nothing written. ---- */
 	{

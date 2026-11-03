@@ -9,7 +9,7 @@
  * before it unmounts the file system (the blocks the suite's pattern file
  * used, freed when clean_test_dir deleted it) and passes it here. The test
  * writes the sync-read pattern into that range through the raw handle and
- * reads it back with the sync, async and batch families, checks the
+ * reads it back with the sync, async, batch and stream families, checks the
  * alignment rules, and zeroes the range when done.
  *
  * It also checks that the driver opens without an index, and that a regular
@@ -286,7 +286,113 @@ main(int argc, char **argv)
 		}
 	}
 
-	/* ---- 8. Leave the range zeroed. ---- */
+	/* ---- 8. Stream-ordered I/O: a stream read, a partial-tail stream
+	 * read (the stream path has its own bounce kernel), then a stream
+	 * write followed on the same stream by a read of the page it wrote,
+	 * waited for once: the read must see the write. An unaligned-end
+	 * stream write is refused through the completion. ---- */
+	{
+		CUstream stream;
+		if (cuStreamCreate(&stream, CU_STREAM_NON_BLOCKING) !=
+		            CUDA_SUCCESS ||
+		    opends_stream_register(stream, 0).err != OPENDS_SUCCESS) {
+			fprintf(stderr, "stream setup failed\n");
+			failed++;
+			goto stream_done;
+		}
+
+		ssize_t r = raw_stream_read(fh, stream, gpu, host, 2 * PAGE,
+		                            dev_off + 4 * PAGE);
+		size_t bad = r == 2 * PAGE
+		                     ? check_pattern(host, 4 * PAGE, 2 * PAGE)
+		                     : 2 * PAGE;
+		if (bad) {
+			fprintf(stderr, "stream read: %zd, %zu bad bytes\n", r,
+			        bad);
+			failed++;
+		} else {
+			fprintf(stderr, "stream read ok\n");
+		}
+
+		/* A stream read may only be partial at its tail (opends.h): a
+		 * tail-bounced read works, a start off the LBA is refused. */
+		size_t n = PAGE - 8;
+		r = raw_stream_read(fh, stream, gpu, host, n,
+		                    dev_off + 4 * PAGE);
+		bad = r == (ssize_t)n ? check_pattern(host, 4 * PAGE, n) : n;
+		ssize_t u = raw_stream_read(fh, stream, gpu, host, n,
+		                            dev_off + 4 * PAGE + 4);
+		if (bad || u != -(ssize_t)OPENDS_INVALID_VALUE) {
+			fprintf(stderr,
+			        "partial-tail stream read: %zd, %zu bad bytes; "
+			        "off-LBA start: %zd (want %d)\n",
+			        r, bad, u, -OPENDS_INVALID_VALUE);
+			failed++;
+		} else {
+			fprintf(stderr, "partial-tail stream read ok, off-LBA "
+			                "start refused ok\n");
+		}
+
+		/* Write the inverse of page 6 from slot 0, read page 6 back
+		 * into slot 1, both queued before either runs. */
+		for (size_t i = 0; i < PAGE; i++)
+			host[i] = (unsigned char)~img[6 * PAGE + i];
+		cuda_buf_from_host(gpu, host, PAGE);
+		cuda_buf_zero((uint8_t *)gpu + PAGE, PAGE);
+		size_t wsz = PAGE, rsz = PAGE;
+		off_t wfo = (off_t)(dev_off + 6 * PAGE), rfo = wfo;
+		off_t wbo = 0, rbo = PAGE;
+		ssize_t wb = -1, rb = -1;
+		opends_error_t werr = opends_stream_write(fh, gpu, &wsz, &wfo,
+		                                          &wbo, &wb, stream);
+		opends_error_t rerr = opends_stream_read(fh, gpu, &rsz, &rfo,
+		                                         &rbo, &rb, stream);
+		int waited = raw_stream_wait(stream, 10.0, "stream write+read");
+		cuda_buf_to_host(host, (uint8_t *)gpu + PAGE, PAGE);
+		int mismatch = 0;
+		for (size_t i = 0; i < PAGE; i++)
+			if (host[i] != (unsigned char)~img[6 * PAGE + i])
+				mismatch++;
+		if (werr.err != OPENDS_SUCCESS || rerr.err != OPENDS_SUCCESS ||
+		    waited < 0 || wb != PAGE || rb != PAGE || mismatch) {
+			fprintf(stderr,
+			        "stream write then read: submit %d/%d, wrote "
+			        "%zd, read %zd, %d mismatches\n",
+			        werr.err, rerr.err, wb, rb, mismatch);
+			failed++;
+		} else {
+			fprintf(stderr, "stream write + in-order read ok\n");
+		}
+
+		/* Ends off an LBA: refused, and page 6 keeps the inverse. */
+		cuda_buf_zero(gpu, PAGE + 1);
+		ssize_t w = raw_stream_write(fh, stream, gpu, host, PAGE + 1,
+		                             dev_off + 6 * PAGE);
+		r = raw_read(fh, gpu, host, PAGE, dev_off + 6 * PAGE);
+		mismatch = 0;
+		for (size_t i = 0; i < PAGE; i++)
+			if (host[i] != (unsigned char)~img[6 * PAGE + i])
+				mismatch++;
+		if (w != -(ssize_t)OPENDS_INVALID_VALUE || r != PAGE ||
+		    mismatch) {
+			fprintf(stderr,
+			        "unaligned-end stream write: %zd (want %d), "
+			        "read %zd, %d byte(s) changed\n",
+			        w, -OPENDS_INVALID_VALUE, r, mismatch);
+			failed++;
+		} else {
+			fprintf(stderr,
+			        "unaligned-end stream write refused ok\n");
+		}
+
+		/* put the pattern back on page 6 */
+		raw_write(fh, gpu, img + 6 * PAGE, PAGE, dev_off + 6 * PAGE);
+		opends_stream_deregister(stream);
+		cuStreamDestroy(stream);
+	}
+stream_done:
+
+	/* ---- 9. Leave the range zeroed. ---- */
 	memset(img, 0, REGION_BYTES);
 	if (raw_write(fh, gpu, img, REGION_BYTES, dev_off) !=
 	    (ssize_t)REGION_BYTES) {
