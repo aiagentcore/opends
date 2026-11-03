@@ -250,13 +250,15 @@ main(int argc, char **argv)
 	fprintf(stderr, "raw read of %u extent(s) %s\n", n_ext,
 	        failed ? "FAILED" : "ok");
 
-	/* ---- 4. Unaligned raw read (head and tail bounce). ---- */
+	/* ---- 4. Unaligned raw read (head and tail bounce). The start is
+	 * off the LBA but on a 4-byte boundary, as the aisio read rules in
+	 * opends.h require of a read that spans whole LBAs. ---- */
 	{
-		size_t n = PAGE - 2;
-		ssize_t r = raw_read(raw_fh, gpu, host, n, ext[0].dev_off + 1);
+		size_t n = PAGE - 8;
+		ssize_t r = raw_read(raw_fh, gpu, host, n, ext[0].dev_off + 4);
 		size_t bad =
 		        r == (ssize_t)n
-		                ? check_pattern(host, ext[0].file_off + 1, n)
+		                ? check_pattern(host, ext[0].file_off + 4, n)
 		                : n;
 		if (bad) {
 			fprintf(stderr,

@@ -156,8 +156,9 @@ batch), and regular files can be registered on the same driver at the same
 time. The extent-index restriction above does not apply to a raw handle:
 nothing is looked up, so a raw read sees what is on the namespace now.
 
-- Reads behave as on a file: any offset and size, short at the end of the
-  device.
+- Reads follow the alignment rules of a file read (see `opends.h`): any
+  size, a start off an LBA boundary on a 4-byte boundary when the read spans
+  whole LBAs, and short at the end of the device.
 - Writes go GPU to NVMe as P2P DMA and must start and end on an LBA boundary;
   otherwise they fail with `OPENDS_INVALID_VALUE` and nothing is written. The
   fd must be open for writing. Like reads, a write is short at the end of the
