@@ -263,6 +263,11 @@ if aisio_test_enabled
     include_directories : aisio_test_inc_dirs,
     dependencies : [opends_aisio_dep, cuda_dep, cuda_drv_dep],
   )
+  executable('test_raw_block_bare_aisio',
+    'tests/test_raw_block_bare_aisio.c',
+    include_directories : aisio_test_inc_dirs,
+    dependencies : [opends_aisio_dep, cuda_dep, cuda_drv_dep],
+  )
   executable('async_read_example',
     'examples/async_read.c',
     include_directories : aisio_test_inc_dirs,
@@ -285,6 +290,7 @@ else
   executable('test_sync_write_aisio', 'tests/skip.c')
   executable('test_stream_write_aisio', 'tests/skip.c')
   executable('test_raw_block_aisio', 'tests/skip.c')
+  executable('test_raw_block_bare_aisio', 'tests/skip.c')
 endif
 
 summary({

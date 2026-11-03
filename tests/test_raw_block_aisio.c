@@ -21,6 +21,7 @@
 #include "read_pattern.h"
 #include "test_aisio_homi.h"
 #include "test_cuda_common.h"
+#include "test_raw_block.h"
 
 #include <cuda.h>
 
@@ -36,7 +37,6 @@
 #include <sys/ioctl.h>
 #include <unistd.h>
 
-#define ENV_RAW_BLOCK "OPENDS_AISIO_RAW_BLOCK"
 #define MAX_EXTENTS 64
 
 /* One extent of the pattern file: where it sits in the file and on disk. */
@@ -85,39 +85,6 @@ fiemap_pattern(int fd, struct ext *out, uint32_t *n_out)
 	free(fm);
 	*n_out = n;
 	return 0;
-}
-
-/* Compare n bytes of host memory with the pattern starting at file offset
- * file_off. Returns the number of mismatching bytes. */
-static size_t
-check_pattern(const unsigned char *host, uint64_t file_off, size_t n)
-{
-	size_t bad = 0;
-	for (size_t i = 0; i < n; i++)
-		if (host[i] != pattern_byte((off_t)(file_off + i)))
-			bad++;
-	return bad;
-}
-
-/* Raw read of n bytes at device offset dev_off into gpu, copied to host.
- * Returns the backend's result (bytes or -error). */
-static ssize_t
-raw_read(opends_handle_t fh, void *gpu, unsigned char *host, size_t n,
-         uint64_t dev_off)
-{
-	cuda_buf_zero(gpu, n);
-	ssize_t r = opends_sync_read(fh, gpu, n, (off_t)dev_off, 0);
-	if (r > 0)
-		cuda_buf_to_host(host, gpu, (size_t)r);
-	return r;
-}
-
-static ssize_t
-raw_write(opends_handle_t fh, void *gpu, const unsigned char *host, size_t n,
-          uint64_t dev_off)
-{
-	cuda_buf_from_host(gpu, host, n);
-	return opends_sync_write(fh, gpu, n, (off_t)dev_off, 0);
 }
 
 /* Put the pattern back on the first page of extent e through the raw handle

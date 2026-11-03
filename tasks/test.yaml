@@ -204,9 +204,32 @@ steps:
           "$(cat /run/homi/ublk_dev)" \
           '{{ config.test.mount_point }}/opends_tests/sync_read_pattern.bin'
 
+  - name: raw_block_bare_prep
+    run: |
+      # Record where the pattern file's blocks are. clean_test_dir frees them
+      # next, and the bare-device test writes into that range.
+      python3 '{{ config.test.repo_path }}/tasks/steps/first_extent.py' \
+        '{{ config.test.mount_point }}/opends_tests/sync_read_pattern.bin' > /run/homi/raw_range && \
+        cat /run/homi/raw_range
+
   - name: clean_test_dir
     run: |
       rm -f '{{ config.test.mount_point }}/opends_tests/sync_read_pattern.bin' '{{ config.test.mount_point }}/opends_tests/coherency_large.bin' '{{ config.test.mount_point }}/opends_tests/write_scratch.bin'
+
+  - name: homi_stack_bare
+    run: |
+      '{{ config.test.repo_path }}/tasks/steps/homi_stack_bare.sh' '{{ config.test.mount_point }}'
+
+  - name: test_raw_block_bare_aisio
+    run: |
+      # No file system, no xal-server: only homi and qublk. OPENDS_XAL_SHM
+      # names an index that does not exist, so the file-registration check
+      # cannot find a stale one either.
+      . '{{ config.test.repo_path }}/tasks/steps/install_prefix.sh' '{{ config.deps.install_prefix | default("/usr/local") }}' && \
+        OPENDS_XAL_SHM=/xal_none \
+        OPENDS_AISIO_RAW_BLOCK=1 \
+        '{{ config.test.build_dir }}/test_raw_block_bare_aisio' \
+          "$(cat /run/homi/ublk_dev)" $(cat /run/homi/raw_range)
 
   - name: homi_stack_down
     run: |
