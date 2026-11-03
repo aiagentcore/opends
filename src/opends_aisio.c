@@ -781,11 +781,10 @@ submit_io_middle(struct driver *d, struct read_cursor *c, struct file_op *op,
 		uint8_t *dst_chunk = c->abs_dst + lbas_done * lba_nbytes;
 
 		op->chunks_remaining++;
-		int srv = is_write
-		                  ? xnvme_nvm_write(ctx, d->nsid, chunk_slba, nlb,
-		                                    dst_chunk, NULL)
-		                  : xnvme_nvm_read(ctx, d->nsid, chunk_slba, nlb,
-		                                   dst_chunk, NULL);
+		int srv = is_write ? xnvme_nvm_write(ctx, d->nsid, chunk_slba,
+		                                     nlb, dst_chunk, NULL)
+		                   : xnvme_nvm_read(ctx, d->nsid, chunk_slba,
+		                                    nlb, dst_chunk, NULL);
 		if (srv == -EBUSY) {
 			op->chunks_remaining--;
 			xnvme_queue_put_cmd_ctx(c->queue, ctx);
@@ -1665,7 +1664,8 @@ opends_handle_register(opends_handle_t *fh, int fd)
 		if (raw_nbytes == 0 ||
 		    (drv->ns_nbytes && raw_nbytes > drv->ns_nbytes)) {
 			fprintf(stderr,
-			        "aisio: fd %d is %" PRIu64 " bytes, namespace is "
+			        "aisio: fd %d is %" PRIu64
+			        " bytes, namespace is "
 			        "%" PRIu64 "; not the exported namespace\n",
 			        fd, raw_nbytes, drv->ns_nbytes);
 			return opends_err(OPENDS_INVALID_VALUE);

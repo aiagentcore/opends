@@ -149,8 +149,9 @@ main(int argc, char **argv)
 	opends_handle_t raw_fh = NULL;
 	opends_error_t err = opends_handle_register(&raw_fh, raw_fd);
 	if (err.err != OPENDS_INVALID_VALUE) {
-		fprintf(stderr, "gate: block fd not refused with %s unset "
-		                "(err %d)\n",
+		fprintf(stderr,
+		        "gate: block fd not refused with %s unset "
+		        "(err %d)\n",
 		        ENV_RAW_BLOCK, err.err);
 		if (err.err == OPENDS_SUCCESS)
 			opends_handle_deregister(raw_fh);
@@ -194,8 +195,9 @@ main(int argc, char **argv)
 		close(raw_fd);
 		return 1;
 	}
-	fprintf(stderr, "pattern file has %u extent(s); first at device "
-	                "offset %" PRIu64 "\n",
+	fprintf(stderr,
+	        "pattern file has %u extent(s); first at device "
+	        "offset %" PRIu64 "\n",
 	        n_ext, ext[0].dev_off);
 
 	void *gpu = cuda_alloc_acquire(FILE_SIZE);
@@ -207,8 +209,8 @@ main(int argc, char **argv)
 
 	/* ---- 3. Raw read of every extent matches the pattern. ---- */
 	for (uint32_t i = 0; i < n_ext; i++) {
-		ssize_t r = raw_read(raw_fh, gpu, host, ext[i].len,
-		                     ext[i].dev_off);
+		ssize_t r =
+		        raw_read(raw_fh, gpu, host, ext[i].len, ext[i].dev_off);
 		size_t bad = r == (ssize_t)ext[i].len
 		                     ? check_pattern(host, ext[i].file_off,
 		                                     ext[i].len)
@@ -228,12 +230,14 @@ main(int argc, char **argv)
 	{
 		size_t n = PAGE - 2;
 		ssize_t r = raw_read(raw_fh, gpu, host, n, ext[0].dev_off + 1);
-		size_t bad = r == (ssize_t)n
-		                     ? check_pattern(host, ext[0].file_off + 1, n)
-		                     : n;
+		size_t bad =
+		        r == (ssize_t)n
+		                ? check_pattern(host, ext[0].file_off + 1, n)
+		                : n;
 		if (bad) {
-			fprintf(stderr, "unaligned raw read: returned %zd, %zu "
-			                "bad bytes\n",
+			fprintf(stderr,
+			        "unaligned raw read: returned %zd, %zu "
+			        "bad bytes\n",
 			        r, bad);
 			failed++;
 		} else {
@@ -241,7 +245,7 @@ main(int argc, char **argv)
 		}
 	}
 
-	/* ---- 5. Register-mode (cudaMalloc + opends_buf_register) read. ---- */
+	/* ---- 5. Read into a cudaMalloc buffer (opends_buf_register). ---- */
 	{
 		void *reg = cuda_register_acquire(PAGE);
 		if (!reg) {
@@ -249,13 +253,14 @@ main(int argc, char **argv)
 		} else {
 			ssize_t r = raw_read(raw_fh, reg, host, PAGE,
 			                     ext[0].dev_off);
-			size_t bad = r == PAGE ? check_pattern(host,
-			                                       ext[0].file_off,
-			                                       PAGE)
-			                       : PAGE;
+			size_t bad =
+			        r == PAGE ? check_pattern(host, ext[0].file_off,
+			                                  PAGE)
+			                  : PAGE;
 			if (bad) {
-				fprintf(stderr, "register-mode raw read: "
-				                "returned %zd, %zu bad bytes\n",
+				fprintf(stderr,
+				        "register-mode raw read: "
+				        "returned %zd, %zu bad bytes\n",
 				        r, bad);
 				failed++;
 			} else {
@@ -280,8 +285,9 @@ main(int argc, char **argv)
 			ssize_t r = raw_read(raw_fh, gpu, host, PAGE,
 			                     ext[0].dev_off);
 			if (r != PAGE || memcmp(host, inv, PAGE) != 0) {
-				fprintf(stderr, "raw write read-back mismatch "
-				                "(read %zd)\n",
+				fprintf(stderr,
+				        "raw write read-back mismatch "
+				        "(read %zd)\n",
 				        r);
 				failed++;
 			} else {
@@ -297,8 +303,9 @@ main(int argc, char **argv)
 		ssize_t r = raw_read(raw_fh, gpu, host, PAGE, ext[0].dev_off);
 		if (w != PAGE || r != PAGE ||
 		    check_pattern(host, ext[0].file_off, PAGE)) {
-			fprintf(stderr, "restore failed (write %zd, read %zd); "
-			                "rerun test_sync_read_prep\n",
+			fprintf(stderr,
+			        "restore failed (write %zd, read %zd); "
+			        "rerun test_sync_read_prep\n",
 			        w, r);
 			failed++;
 		} else {
@@ -315,8 +322,9 @@ main(int argc, char **argv)
 		ssize_t r = raw_read(raw_fh, gpu, host, PAGE, ext[0].dev_off);
 		if (w != -(ssize_t)OPENDS_INVALID_VALUE || r != PAGE ||
 		    check_pattern(host, ext[0].file_off, PAGE)) {
-			fprintf(stderr, "unaligned raw write: returned %zd "
-			                "(want %d), pattern intact=%s\n",
+			fprintf(stderr,
+			        "unaligned raw write: returned %zd "
+			        "(want %d), pattern intact=%s\n",
 			        w, -OPENDS_INVALID_VALUE,
 			        r == PAGE ? "yes" : "no");
 			failed++;
@@ -332,8 +340,9 @@ main(int argc, char **argv)
 		ssize_t z = opends_sync_read(raw_fh, gpu, PAGE,
 		                             (off_t)dev_nbytes, 0);
 		if (r != PAGE || z != 0) {
-			fprintf(stderr, "end of device: read %zd (want %d), "
-			                "past end %zd (want 0)\n",
+			fprintf(stderr,
+			        "end of device: read %zd (want %d), "
+			        "past end %zd (want 0)\n",
 			        r, PAGE, z);
 			failed++;
 		} else {
