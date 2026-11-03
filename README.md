@@ -119,6 +119,8 @@ the open.
   every process in the group shares, so xNVMe's 1 GiB default is too large.
 - `OPENDS_AISIO_DEVICE_HEAP_MB`: GPU device heap for this process. Default 0,
   which leaves it at the xNVMe default.
+- `OPENDS_AISIO_RAW_BLOCK`: `1` allows raw block mode (below). Default off:
+  registering a block device fd fails with `OPENDS_INVALID_VALUE`.
 
 ### Writes and the extent index
 
@@ -142,6 +144,28 @@ XFS does not promise it, and OpenDS does not check it.
 To read written data through OpenDS, restart xal-server after the writes so it
 indexes again. This restriction is temporary: a re-index on request is being
 pursued in xal-server, and the restriction goes when it lands.
+
+### Raw block mode
+
+With `OPENDS_AISIO_RAW_BLOCK=1`, `opends_handle_register` accepts the
+whole-disk block device qublk exports for the namespace (`/dev/ublkbN`,
+opened with `O_DIRECT`). On such a handle `file_offset` is the byte offset on
+the namespace: `file_offset / lba_size` is the LBA, with no filesystem or
+extent lookup in the path. All I/O families work (sync, async, stream,
+batch), and regular files can be registered on the same driver at the same
+time. The extent-index restriction above does not apply to a raw handle:
+nothing is looked up, so a raw read sees what is on the namespace now.
+
+- Reads behave as on a file: any offset and size, short at the end of the
+  device.
+- Writes go GPU to NVMe as P2P DMA and must start and end on an LBA boundary;
+  otherwise they fail with `OPENDS_INVALID_VALUE`. The fd must be open for
+  writing.
+- Partitions are refused (their offset 0 is not LBA 0), as is a device larger
+  than the namespace.
+- Raw writes bypass the kernel, homi and xal-server. Do not write to LBAs a
+  mounted filesystem owns: the filesystem and its page cache will not see the
+  change.
 
 ## Performance
 

@@ -165,6 +165,12 @@ opends_error_t opends_driver_set_max_direct_io_size(size_t max_direct_io_size);
  * before it can be used for I/O in any mode. The file must be
  * opened with O_DIRECT. Registration fails with OPENDS_DIO_NOT_SET
  * otherwise. Linux only.
+ *
+ * The aisio backend also accepts a whole-disk block device fd when
+ * OPENDS_AISIO_RAW_BLOCK=1 (raw block mode): file_offset is then the
+ * byte offset on the NVMe namespace, reads work at any alignment, and
+ * writes must be LBA-aligned. Without the variable a block device fd
+ * fails with OPENDS_INVALID_VALUE.
  */
 opends_error_t opends_handle_register(opends_handle_t *fh, int fd);
 void opends_handle_deregister(opends_handle_t fh);

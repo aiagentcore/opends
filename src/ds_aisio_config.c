@@ -21,6 +21,7 @@
 #define ENV_HOMI_ID "OPENDS_AISIO_HOMI_ID"
 #define ENV_HOST_HEAP_MB "OPENDS_AISIO_HOST_HEAP_MB"
 #define ENV_DEVICE_HEAP_MB "OPENDS_AISIO_DEVICE_HEAP_MB"
+#define ENV_RAW_BLOCK AISIO_CONFIG_ENV_RAW_BLOCK
 #define DEFAULT_XAL_SHM "/xal_dev0"
 #define DEFAULT_HOMI_ID 1
 #define DEFAULT_IO_THREADS 2
@@ -113,6 +114,9 @@ aisio_config_read(struct aisio_config *cfg)
 
 	const char *aligned = getenv(ENV_ASSUME_ALIGNED_ONLY);
 	cfg->assume_aligned_only = aligned && aligned[0] && aligned[0] != '0';
+
+	const char *raw = getenv(ENV_RAW_BLOCK);
+	cfg->raw_block_enabled = raw && raw[0] && raw[0] != '0';
 
 	if (env_int(ENV_HOST_HEAP_MB, DEFAULT_HOST_HEAP_MB, 1, MAX_HEAP_MB,
 	            &n) < 0) {

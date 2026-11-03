@@ -12,6 +12,7 @@
 #include <stdint.h>
 
 #define AISIO_CONFIG_XAL_SHM_MAXLEN 128
+#define AISIO_CONFIG_ENV_RAW_BLOCK "OPENDS_AISIO_RAW_BLOCK"
 
 struct aisio_config {
 	uint32_t homi_id; ///< Multi-process group the HOMI server is primary of
@@ -23,6 +24,8 @@ struct aisio_config {
 	bool busy_spin;
 	uint64_t cpu_mask;
 	bool assume_aligned_only;
+	bool raw_block_enabled; ///< OPENDS_AISIO_RAW_BLOCK=1: block device fds
+	                        ///< may be registered (raw block mode)
 	size_t host_heap_nbytes;
 	size_t device_heap_nbytes;
 };

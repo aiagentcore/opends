@@ -16,6 +16,12 @@
  * Writes go through the kernel-mounted filesystem: the source is staged to a
  * host buffer and pwritten via the fd, so XFS over qublk allocates blocks and
  * writes the data; the file's extents are then re-resolved for later P2P reads.
+ *
+ * Raw block mode (opt-in, OPENDS_AISIO_RAW_BLOCK=1): a handle registered on
+ * the whole-disk block device qublk exports (/dev/ublkbN) has no extents to
+ * resolve: byte offset / lba_size is the namespace LBA. Reads and writes both
+ * run as P2P DMA between GPU memory and the NVMe; raw writes must be
+ * LBA-aligned and never touch the kernel filesystem or the xal-server index.
  */
 
 #define _GNU_SOURCE
@@ -29,6 +35,7 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <inttypes.h>
 #include <limits.h>
 #include <pthread.h>
 #include <sched.h>
@@ -38,10 +45,14 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/ioctl.h>
 #include <sys/stat.h>
+#include <sys/sysmacros.h>
 #include <sys/types.h>
 #include <time.h>
 #include <unistd.h>
+
+#include <linux/fs.h>
 
 #include <libxal.h>
 #include <libxnvme.h>
@@ -83,6 +94,8 @@ struct map_run {
 struct registered_file {
 	int fd;
 	int oflags;
+	bool raw;            /* block-device fd: offset / lba_size is the LBA */
+	uint64_t raw_nbytes; /* device capacity (BLKGETSIZE64); raw only */
 };
 
 struct opends_stream {
@@ -167,6 +180,7 @@ struct driver {
 	uint32_t lba_size;
 	uint32_t lba_shift;
 	uint32_t mdts_nbytes;
+	uint64_t ns_nbytes; ///< Namespace capacity, bounds a raw handle
 	struct buf_entry bufs[MAX_BUF_ENTRIES]; ///< Sorted by base
 	int buf_count;
 	size_t chunk_nbytes; ///< Allocation granularity registrations round to
@@ -618,14 +632,30 @@ out:
 }
 
 static int
-resolve_extents(struct driver *d, int fd, struct ds_extent **out,
-                uint32_t *out_n)
+resolve_extents(struct driver *d, struct registered_file *h,
+                struct ds_extent **out, uint32_t *out_n)
 {
 	char fdpath[64], path[PATH_MAX];
 	ssize_t plen;
 	int rc;
 
-	snprintf(fdpath, sizeof(fdpath), "/proc/self/fd/%d", fd);
+	/* A raw handle is one extent spanning the whole device: offset 0 of
+	 * the exported block device is LBA 0 of the namespace, which is the
+	 * same identity the xal-server index relies on. The caller frees it
+	 * like a resolved list. */
+	if (h->raw) {
+		struct ds_extent *ex = calloc(1, sizeof(*ex));
+		if (!ex)
+			return -ENOMEM;
+		ex->file_offset = 0;
+		ex->slba = 0;
+		ex->length = h->raw_nbytes;
+		*out = ex;
+		*out_n = 1;
+		return 0;
+	}
+
+	snprintf(fdpath, sizeof(fdpath), "/proc/self/fd/%d", h->fd);
 	plen = readlink(fdpath, path, sizeof(path) - 1);
 	if (plen < 0)
 		return -errno;
@@ -678,6 +708,7 @@ open_device(struct driver *d)
 	d->lba_size = geo->lba_nbytes ? geo->lba_nbytes : geo->nbytes;
 	d->mdts_nbytes =
 	        geo->mdts_nbytes ? geo->mdts_nbytes : DEFAULT_BOUNCE_SIZE;
+	d->ns_nbytes = geo->tbytes;
 
 	if (d->lba_size == 0) {
 		fprintf(stderr,
@@ -721,9 +752,12 @@ chunk_cb(struct xnvme_cmd_ctx *ctx, void *opaque)
 	xnvme_queue_put_cmd_ctx(ctx->async.queue, ctx);
 }
 
+/* Submit the LBA-aligned middle of a span as whole-LBA commands, chunked by
+ * MDTS. Reads land in GPU memory; writes (raw handles only) are sourced from
+ * it. Both directions complete through chunk_cb. */
 static int
-submit_read_middle(struct driver *d, struct read_cursor *c, struct file_op *op,
-                   uint64_t middle_lbas)
+submit_io_middle(struct driver *d, struct read_cursor *c, struct file_op *op,
+                 uint64_t middle_lbas, bool is_write)
 {
 	uint32_t lba_nbytes = d->lba_size;
 	uint64_t max_chunk_lbas = d->mdts_nbytes >> d->lba_shift;
@@ -747,8 +781,11 @@ submit_read_middle(struct driver *d, struct read_cursor *c, struct file_op *op,
 		uint8_t *dst_chunk = c->abs_dst + lbas_done * lba_nbytes;
 
 		op->chunks_remaining++;
-		int srv = xnvme_nvm_read(ctx, d->nsid, chunk_slba, nlb,
-		                         dst_chunk, NULL);
+		int srv = is_write
+		                  ? xnvme_nvm_write(ctx, d->nsid, chunk_slba, nlb,
+		                                    dst_chunk, NULL)
+		                  : xnvme_nvm_read(ctx, d->nsid, chunk_slba, nlb,
+		                                   dst_chunk, NULL);
 		if (srv == -EBUSY) {
 			op->chunks_remaining--;
 			xnvme_queue_put_cmd_ctx(c->queue, ctx);
@@ -883,13 +920,20 @@ submit_partial(struct io_worker *w, struct file_op *op, uint8_t *abs_dst,
 	return submit_host_bounce(w, op, abs_dst, slba, src_off, nbytes);
 }
 
+/* Resolve the op's extents and submit it. Reads for any handle; writes only
+ * for raw handles (filesystem writes take dispatch_write), which must be
+ * LBA-aligned at both ends because there is no read-modify-write path. */
 static void
-start_read_op(struct io_worker *w, struct file_op *op)
+start_io_op(struct io_worker *w, struct file_op *op)
 {
 	struct driver *d = w->drv;
 
 	if (d->lba_size == 0) {
 		op->err = OPENDS_INTERNAL_ERROR;
+		return;
+	}
+	if (op->is_write && (op->h->oflags & O_ACCMODE) == O_RDONLY) {
+		op->err = OPENDS_INVALID_VALUE;
 		return;
 	}
 	if ((d->mdts_nbytes >> d->lba_shift) == 0) {
@@ -921,7 +965,7 @@ start_read_op(struct io_worker *w, struct file_op *op)
 
 	struct ds_extent *extents;
 	uint32_t extent_count;
-	int frc = resolve_extents(d, op->h->fd, &extents, &extent_count);
+	int frc = resolve_extents(d, op->h, &extents, &extent_count);
 	if (frc < 0) {
 		op->err = OPENDS_FS_SETUP_ERROR;
 		return;
@@ -952,6 +996,10 @@ start_read_op(struct io_worker *w, struct file_op *op)
 		if (head_off) {
 			size_t head_bytes = d->lba_size - head_off;
 
+			if (op->is_write) {
+				op->err = OPENDS_INVALID_VALUE;
+				goto out;
+			}
 			if (head_bytes > remaining)
 				head_bytes = remaining;
 			if (remaining - head_bytes >= d->lba_size &&
@@ -976,7 +1024,8 @@ start_read_op(struct io_worker *w, struct file_op *op)
 			        .abs_dst = abs_dst,
 			        .remaining = remaining,
 			};
-			if (submit_read_middle(d, &c, op, middle_lbas) < 0)
+			if (submit_io_middle(d, &c, op, middle_lbas,
+			                     op->is_write) < 0)
 				goto out;
 			cur_slba = c.cur_slba;
 			abs_dst = c.abs_dst;
@@ -984,6 +1033,10 @@ start_read_op(struct io_worker *w, struct file_op *op)
 		}
 
 		if (tail_bytes) {
+			if (op->is_write) {
+				op->err = OPENDS_INVALID_VALUE;
+				goto out;
+			}
 			if (submit_partial(w, op, abs_dst, cur_slba, 0,
 			                   tail_bytes) < 0)
 				goto out;
@@ -1090,7 +1143,7 @@ dispatch_write(struct io_worker *w, struct file_op *op)
 static void
 dispatch_pending(struct io_worker *w, struct file_op *op)
 {
-	if (op->is_write) {
+	if (op->is_write && !op->h->raw) {
 		dispatch_write(w, op);
 		return;
 	}
@@ -1100,7 +1153,7 @@ dispatch_pending(struct io_worker *w, struct file_op *op)
 	op->err = 0;
 	op->n_bounces = 0;
 	__atomic_store_n(&op->state, FILE_OP_IN_FLIGHT, __ATOMIC_RELEASE);
-	start_read_op(w, op);
+	start_io_op(w, op);
 }
 
 static void
@@ -1582,11 +1635,50 @@ opends_handle_register(opends_handle_t *fh, int fd)
 	if (!(oflags & O_DIRECT))
 		return opends_err(OPENDS_DIO_NOT_SET);
 
+	struct stat st;
+	if (fstat(fd, &st) < 0)
+		return opends_err(OPENDS_INVALID_VALUE);
+	bool raw = S_ISBLK(st.st_mode);
+	uint64_t raw_nbytes = 0;
+	if (raw) {
+		if (!drv->cfg.raw_block_enabled) {
+			fprintf(stderr,
+			        "aisio: fd %d is a block device; set %s=1 to "
+			        "register it in raw block mode\n",
+			        fd, AISIO_CONFIG_ENV_RAW_BLOCK);
+			return opends_err(OPENDS_INVALID_VALUE);
+		}
+		/* The identity offset / lba_size = LBA holds only for the
+		 * whole disk: a partition's offset 0 is not LBA 0. */
+		char part[64];
+		snprintf(part, sizeof(part), "/sys/dev/block/%u:%u/partition",
+		         major(st.st_rdev), minor(st.st_rdev));
+		if (access(part, F_OK) == 0) {
+			fprintf(stderr,
+			        "aisio: fd %d is a partition; raw block mode "
+			        "needs the whole device\n",
+			        fd);
+			return opends_err(OPENDS_INVALID_VALUE);
+		}
+		if (ioctl(fd, BLKGETSIZE64, &raw_nbytes) < 0)
+			return opends_err(OPENDS_INVALID_VALUE);
+		if (raw_nbytes == 0 ||
+		    (drv->ns_nbytes && raw_nbytes > drv->ns_nbytes)) {
+			fprintf(stderr,
+			        "aisio: fd %d is %" PRIu64 " bytes, namespace is "
+			        "%" PRIu64 "; not the exported namespace\n",
+			        fd, raw_nbytes, drv->ns_nbytes);
+			return opends_err(OPENDS_INVALID_VALUE);
+		}
+	}
+
 	struct registered_file *h = calloc(1, sizeof(*h));
 	if (!h)
 		return opends_err(OPENDS_INTERNAL_ERROR);
 	h->fd = fd;
 	h->oflags = oflags;
+	h->raw = raw;
+	h->raw_nbytes = raw_nbytes;
 
 	*fh = h;
 	__atomic_fetch_add(&use_count, 1, __ATOMIC_RELAXED);
