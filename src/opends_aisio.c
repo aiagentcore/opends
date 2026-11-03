@@ -174,7 +174,8 @@ struct io_worker {
 struct driver {
 	char dev_uri[XNVME_IDENT_URI_LEN]; ///< NVMe device the HOMI server owns
 	struct aisio_config cfg;           ///< From the environment at open
-	struct xal *xal; ///< Attach to the index xal-server publishes
+	struct xal *xal; ///< The index xal-server publishes; NULL until a
+	                 ///< regular file is registered (index_attach)
 	struct xnvme_dev *xdev;
 	uint32_t nsid;
 	uint32_t lba_size;
@@ -1451,6 +1452,24 @@ xal_attach(struct driver *d)
 	return rc;
 }
 
+/* Attach to the extent index on the first regular-file registration rather
+ * than at driver open: a raw block handle needs no index, so a process that
+ * registers only block devices runs with homi and qublk alone, no mounted
+ * filesystem and no xal-server. Serialized by reg_lock; the registering
+ * thread publishes the handle after this returns, and an I/O thread reads
+ * d->xal only for an op on a registered file, so it sees the attach. */
+static int
+index_attach(struct driver *d)
+{
+	int rc = 0;
+
+	pthread_mutex_lock(&d->reg_lock);
+	if (!d->xal)
+		rc = xal_attach(d);
+	pthread_mutex_unlock(&d->reg_lock);
+	return rc;
+}
+
 /* Ask homi which device it holds; -ENOENT and an empty list mean "not yet". */
 static int
 homi_device(struct driver *d)
@@ -1508,20 +1527,10 @@ opends_driver_open(void)
 	pthread_mutex_init(&d->reg_lock, NULL);
 	pthread_mutex_init(&d->alloc_lock, NULL);
 
-	int rc = xal_attach(d);
-	if (rc < 0) {
-		pthread_mutex_destroy(&d->alloc_lock);
-		pthread_mutex_destroy(&d->submit_lock);
-		pthread_mutex_destroy(&d->reg_lock);
-		free(d);
-		return opends_err(OPENDS_FS_SETUP_ERROR);
-	}
-
 	drv = d;
 
 	int orc = open_device(d);
 	if (orc < 0) {
-		xal_close(d->xal);
 		pthread_mutex_destroy(&d->alloc_lock);
 		pthread_mutex_destroy(&d->submit_lock);
 		pthread_mutex_destroy(&d->reg_lock);
@@ -1533,7 +1542,6 @@ opends_driver_open(void)
 	if (arc != 0) {
 		fprintf(stderr, "aisio: workers_setup failed\n");
 		xnvme_dev_close(d->xdev);
-		xal_close(d->xal);
 		pthread_mutex_destroy(&d->alloc_lock);
 		pthread_mutex_destroy(&d->submit_lock);
 		pthread_mutex_destroy(&d->reg_lock);
@@ -1563,8 +1571,8 @@ opends_driver_close(void)
 
 	if (drv->xdev)
 		xnvme_dev_close(drv->xdev);
-
-	xal_close(drv->xal);
+	if (drv->xal)
+		xal_close(drv->xal);
 
 	pthread_mutex_destroy(&drv->alloc_lock);
 	pthread_mutex_destroy(&drv->submit_lock);
@@ -1637,6 +1645,8 @@ opends_handle_register(opends_handle_t *fh, int fd)
 		return opends_err(OPENDS_INVALID_VALUE);
 	bool raw = S_ISBLK(st.st_mode);
 	uint64_t raw_nbytes = 0;
+	if (!raw && index_attach(drv) < 0)
+		return opends_err(OPENDS_FS_SETUP_ERROR);
 	if (raw) {
 		if (!drv->cfg.raw_block_enabled) {
 			fprintf(stderr,

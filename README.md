@@ -93,7 +93,11 @@ The AiSIO backend reads its configuration from environment variables at
 the open.
 
 - `OPENDS_XAL_SHM`: Shared-memory name of the xal-server extent index.
-  Default `/xal_dev0`.
+  Default `/xal_dev0`. The driver attaches to it when the first regular file
+  is registered, not at open, so a process that registers only block devices
+  (raw block mode, below) needs no xal-server. Registering a file while no
+  index is published fails with `OPENDS_FS_SETUP_ERROR` after a minute of
+  retries.
 - `OPENDS_AISIO_IO_THREADS`: Number of internal IO worker threads. Default 2.
   Driver open creates one NVMe queue per worker.
 - `OPENDS_AISIO_QUEUE_DEPTH`: xNVMe queue depth per worker. Default 8.
@@ -155,6 +159,12 @@ extent lookup in the path. All I/O families work (sync, async, stream,
 batch), and regular files can be registered on the same driver at the same
 time. The extent-index restriction above does not apply to a raw handle:
 nothing is looked up, so a raw read sees what is on the namespace now.
+
+The minimal stack for raw block mode is `homi serve` and `qublk serve`: no
+file system on the namespace, no mount and no xal-server. This is the
+uGDS-style use, a KV cache for instance, where the process owns the block
+device and lays it out itself. `test_raw_block_bare_aisio` runs that way in
+the test suite.
 
 - Reads follow the alignment rules of a file read (see `opends.h`): any
   size, a start off an LBA boundary on a 4-byte boundary when the read spans
