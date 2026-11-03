@@ -55,7 +55,9 @@
  *   stream read must start on an LBA boundary, and only its tail may
  *   be partial. Both violations fail with OPENDS_INVALID_VALUE. With
  *   OPENDS_AISIO_ASSUME_ALIGNED_ONLY set, every read must be fully
- *   LBA-aligned.
+ *   LBA-aligned. A write to a raw block handle (OPENDS_AISIO_RAW_BLOCK)
+ *   must start and end on an LBA boundary; one that does not fails with
+ *   OPENDS_INVALID_VALUE and writes nothing.
  */
 #ifndef OPENDS_H_
 #define OPENDS_H_

@@ -920,8 +920,10 @@ submit_partial(struct io_worker *w, struct file_op *op, uint8_t *abs_dst,
 }
 
 /* Resolve the op's extents and submit it. Reads for any handle; writes only
- * for raw handles (filesystem writes take dispatch_write), which must be
- * LBA-aligned at both ends because there is no read-modify-write path. */
+ * for raw handles (filesystem writes take dispatch_write). A write must be
+ * LBA-aligned at both ends: there is no read-modify-write path, and it is
+ * checked before anything is submitted, so a refused write leaves the device
+ * untouched. */
 static void
 start_io_op(struct io_worker *w, struct file_op *op)
 {
@@ -961,6 +963,10 @@ start_io_op(struct io_worker *w, struct file_op *op)
 		return;
 	}
 	uint64_t req_end = req_start + size;
+	if (op->is_write && ((req_start | size) & (d->lba_size - 1))) {
+		op->err = OPENDS_INVALID_VALUE;
+		return;
+	}
 
 	struct ds_extent *extents;
 	uint32_t extent_count;
@@ -995,10 +1001,6 @@ start_io_op(struct io_worker *w, struct file_op *op)
 		if (head_off) {
 			size_t head_bytes = d->lba_size - head_off;
 
-			if (op->is_write) {
-				op->err = OPENDS_INVALID_VALUE;
-				goto out;
-			}
 			if (head_bytes > remaining)
 				head_bytes = remaining;
 			if (remaining - head_bytes >= d->lba_size &&
@@ -1032,10 +1034,6 @@ start_io_op(struct io_worker *w, struct file_op *op)
 		}
 
 		if (tail_bytes) {
-			if (op->is_write) {
-				op->err = OPENDS_INVALID_VALUE;
-				goto out;
-			}
 			if (submit_partial(w, op, abs_dst, cur_slba, 0,
 			                   tail_bytes) < 0)
 				goto out;

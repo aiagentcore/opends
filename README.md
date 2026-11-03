@@ -159,8 +159,9 @@ nothing is looked up, so a raw read sees what is on the namespace now.
 - Reads behave as on a file: any offset and size, short at the end of the
   device.
 - Writes go GPU to NVMe as P2P DMA and must start and end on an LBA boundary;
-  otherwise they fail with `OPENDS_INVALID_VALUE`. The fd must be open for
-  writing.
+  otherwise they fail with `OPENDS_INVALID_VALUE` and nothing is written. The
+  fd must be open for writing. Like reads, a write is short at the end of the
+  device.
 - Partitions are refused (their offset 0 is not LBA 0), as is a device larger
   than the namespace.
 - Raw writes bypass the kernel, homi and xal-server. Do not write to LBAs a

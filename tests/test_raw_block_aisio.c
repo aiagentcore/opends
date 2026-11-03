@@ -120,6 +120,30 @@ raw_write(opends_handle_t fh, void *gpu, const unsigned char *host, size_t n,
 	return opends_sync_write(fh, gpu, n, (off_t)dev_off, 0);
 }
 
+/* Put the pattern back on the first page of extent e through the raw handle
+ * and read it back. Returns 0 when the page holds the pattern again. */
+static int
+restore_page(opends_handle_t fh, void *gpu, unsigned char *host,
+             const struct ext *e)
+{
+	unsigned char *img = malloc(PAGE);
+	if (!img)
+		return -1;
+	for (size_t i = 0; i < PAGE; i++)
+		img[i] = pattern_byte((off_t)(e->file_off + i));
+	ssize_t w = raw_write(fh, gpu, img, PAGE, e->dev_off);
+	ssize_t r = raw_read(fh, gpu, host, PAGE, e->dev_off);
+	free(img);
+	if (w != PAGE || r != PAGE || check_pattern(host, e->file_off, PAGE)) {
+		fprintf(stderr,
+		        "restore failed (write %zd, read %zd); "
+		        "rerun test_sync_read_prep\n",
+		        w, r);
+		return -1;
+	}
+	return 0;
+}
+
 int
 main(int argc, char **argv)
 {
@@ -297,25 +321,16 @@ main(int argc, char **argv)
 
 		/* Restore, whatever happened above, so the pattern file is
 		 * intact for the rest of the suite. */
-		for (size_t i = 0; i < PAGE; i++)
-			inv[i] = pattern_byte((off_t)(ext[0].file_off + i));
-		w = raw_write(raw_fh, gpu, inv, PAGE, ext[0].dev_off);
-		ssize_t r = raw_read(raw_fh, gpu, host, PAGE, ext[0].dev_off);
-		if (w != PAGE || r != PAGE ||
-		    check_pattern(host, ext[0].file_off, PAGE)) {
-			fprintf(stderr,
-			        "restore failed (write %zd, read %zd); "
-			        "rerun test_sync_read_prep\n",
-			        w, r);
+		if (restore_page(raw_fh, gpu, host, &ext[0]) < 0)
 			failed++;
-		} else {
+		else
 			fprintf(stderr, "pattern restored ok\n");
-		}
 		free(inv);
 	}
 
-	/* ---- 7. Unaligned raw write is refused, nothing written. ---- */
+	/* ---- 7. Unaligned raw writes are refused, nothing written. ---- */
 	{
+		/* Start off an LBA boundary. */
 		cuda_buf_zero(gpu, PAGE);
 		ssize_t w = opends_sync_write(raw_fh, gpu, PAGE,
 		                              (off_t)(ext[0].dev_off + 1), 0);
@@ -323,13 +338,45 @@ main(int argc, char **argv)
 		if (w != -(ssize_t)OPENDS_INVALID_VALUE || r != PAGE ||
 		    check_pattern(host, ext[0].file_off, PAGE)) {
 			fprintf(stderr,
-			        "unaligned raw write: returned %zd "
-			        "(want %d), pattern intact=%s\n",
+			        "unaligned-start raw write: returned "
+			        "%zd (want %d), pattern intact=%s\n",
 			        w, -OPENDS_INVALID_VALUE,
 			        r == PAGE ? "yes" : "no");
 			failed++;
+			if (restore_page(raw_fh, gpu, host, &ext[0]) < 0)
+				failed++;
 		} else {
-			fprintf(stderr, "unaligned raw write refused ok\n");
+			fprintf(stderr,
+			        "unaligned-start raw write refused ok\n");
+		}
+
+		/* Start on an LBA boundary, end off one. The whole op must be
+		 * refused before anything reaches the device: the first page
+		 * must still hold the pattern afterwards. */
+		size_t n = PAGE + 1;
+		if (ext[0].len >= n) {
+			cuda_buf_zero(gpu, n);
+			w = opends_sync_write(raw_fh, gpu, n,
+			                      (off_t)ext[0].dev_off, 0);
+			r = raw_read(raw_fh, gpu, host, PAGE, ext[0].dev_off);
+			size_t bad =
+			        r == PAGE ? check_pattern(host, ext[0].file_off,
+			                                  PAGE)
+			                  : PAGE;
+			if (w != -(ssize_t)OPENDS_INVALID_VALUE || bad) {
+				fprintf(stderr,
+				        "unaligned-end raw write: returned %zd "
+				        "(want %d), %zu byte(s) of the first "
+				        "page changed\n",
+				        w, -OPENDS_INVALID_VALUE, bad);
+				failed++;
+				if (bad && restore_page(raw_fh, gpu, host,
+				                        &ext[0]) < 0)
+					failed++;
+			} else {
+				fprintf(stderr,
+				        "unaligned-end raw write refused ok\n");
+			}
 		}
 	}
 
