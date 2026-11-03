@@ -155,10 +155,11 @@ With `OPENDS_AISIO_RAW_BLOCK=1`, `opends_handle_register` accepts the
 whole-disk block device qublk exports for the namespace (`/dev/ublkbN`,
 opened with `O_DIRECT`). On such a handle `file_offset` is the byte offset on
 the namespace: `file_offset / lba_size` is the LBA, with no filesystem or
-extent lookup in the path. All I/O families work (sync, async, stream,
-batch), and regular files can be registered on the same driver at the same
-time. The extent-index restriction above does not apply to a raw handle:
-nothing is looked up, so a raw read sees what is on the namespace now.
+extent lookup in the path. All I/O families work, and the raw block tests
+cover each of them: sync, async, stream and batch. Regular files can be
+registered on the same driver at the same time. The extent-index restriction
+above does not apply to a raw handle: nothing is looked up, so a raw read sees
+what is on the namespace now.
 
 The minimal stack for raw block mode is `homi serve` and `qublk serve`: no
 file system on the namespace, no mount and no xal-server. This is the
@@ -199,6 +200,33 @@ _Commit `93fd019` (kernel `6.8.12-dmabuf`, NVMe `Samsung S4LV008[Pascal]`, GPU
 | lmcacheish    | sync   |           5533 |           6151 |
 | lmcacheish    | stream |           4991 |           5368 |
 | lmcacheish    | async  |              - |           5384 |
+
+### Raw block mode against files
+
+_Driver at commit `116863d` (kernel `6.8.12-dmabuf`, NVMe `Samsung SSD 990 PRO
+1TB`, GPU `NVIDIA RTX PRO 2000 Blackwell`), default AiSIO settings. Each leg
+moves one 2 GiB region; mean of two runs, one with the file handle first and
+one with the raw handle first._
+
+`bench_raw_block_aisio` reads and writes the largest extent of a file through
+a file handle and the same blocks through a raw handle of the ublk device
+(`tasks/bench_raw_block.yaml`, run with `scripts/bench/raw_block.py`).
+
+| op    | mode   | chunk  | qd | file (MiB/s) | raw (MiB/s) |
+|-------|--------|--------|----|--------------|-------------|
+| read  | sync   |  4 MiB |  1 |         5634 |        5606 |
+| read  | sync   | 16 MiB |  1 |         6609 |        6662 |
+| read  | async  |  4 MiB |  8 |         7105 |        7087 |
+| read  | async  | 16 MiB |  8 |         5244 |        5184 |
+| write | sync   |  4 MiB |  1 |         1004 |        5648 |
+| write | sync   | 16 MiB |  1 |          968 |        6490 |
+| write | async  |  4 MiB |  8 |         3511 |        6672 |
+| write | async  | 16 MiB |  8 |         1308 |        6588 |
+| write | stream |  4 MiB |  8 |         3496 |        6601 |
+
+Reads take the same P2P path either way, so the two handles match. A write to
+a file handle goes through the kernel with a GPU-to-host copy first; a raw
+write is P2P DMA from the GPU.
 
 ## OpenDS API
 
