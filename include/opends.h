@@ -168,11 +168,13 @@ opends_error_t opends_driver_set_max_direct_io_size(size_t max_direct_io_size);
  * opened with O_DIRECT. Registration fails with OPENDS_DIO_NOT_SET
  * otherwise. Linux only.
  *
- * The aisio backend also accepts a whole-disk block device fd when
- * OPENDS_AISIO_RAW_BLOCK=1 (raw block mode): file_offset is then the
- * byte offset on the NVMe namespace, reads follow the file read rules,
- * and writes must be LBA-aligned. Without the variable a block device fd
- * fails with OPENDS_INVALID_VALUE. Registering a regular file attaches
+ * The aisio backend also accepts the whole-disk ublk device qublk
+ * exports (/dev/ublkbN) when OPENDS_AISIO_RAW_BLOCK=1 (raw block mode):
+ * file_offset is then the byte offset on the NVMe namespace, reads
+ * follow the file read rules, and writes must be LBA-aligned. Any other
+ * block device fd (another disk, a loop or dm device, a partition), and
+ * any block device fd without the variable, fails with
+ * OPENDS_INVALID_VALUE. Registering a regular file attaches
  * the backend to the xal-server extent index, and fails with
  * OPENDS_FS_SETUP_ERROR when none is published; a raw handle needs no
  * index.

@@ -1626,6 +1626,32 @@ opends_get_version(unsigned *major, unsigned *minor, unsigned *patch)
 /*  Handle registration                                               */
 /* ------------------------------------------------------------------ */
 
+/* qublk exports the namespace as the whole disk /dev/ublkbN. Any other block
+ * device (another disk, a loop or dm device, a partition, whose offset 0 is
+ * not LBA 0) has its own LBA space, and a raw handle on it would read and
+ * write the namespace's LBAs instead, so only a ublk disk is accepted. */
+static bool
+is_ublk_disk(dev_t rdev)
+{
+	char link[64], target[PATH_MAX];
+
+	snprintf(link, sizeof(link), "/sys/dev/block/%u:%u", major(rdev),
+	         minor(rdev));
+	ssize_t n = readlink(link, target, sizeof(target) - 1);
+	if (n < 0)
+		return false;
+	target[n] = '\0';
+
+	const char *name = strrchr(target, '/');
+	name = name ? name + 1 : target;
+	if (strncmp(name, "ublkb", 5) != 0 || !name[5])
+		return false;
+	for (const char *c = name + 5; *c; c++)
+		if (*c < '0' || *c > '9')
+			return false;
+	return true;
+}
+
 opends_error_t
 opends_handle_register(opends_handle_t *fh, int fd)
 {
@@ -1655,22 +1681,18 @@ opends_handle_register(opends_handle_t *fh, int fd)
 			        fd, AISIO_CONFIG_ENV_RAW_BLOCK);
 			return opends_err(OPENDS_INVALID_VALUE);
 		}
-		/* The identity offset / lba_size = LBA holds only for the
-		 * whole disk: a partition's offset 0 is not LBA 0. */
-		char part[64];
-		snprintf(part, sizeof(part), "/sys/dev/block/%u:%u/partition",
-		         major(st.st_rdev), minor(st.st_rdev));
-		if (access(part, F_OK) == 0) {
+		if (!is_ublk_disk(st.st_rdev)) {
 			fprintf(stderr,
-			        "aisio: fd %d is a partition; raw block mode "
-			        "needs the whole device\n",
+			        "aisio: fd %d is not a ublk disk; raw block "
+			        "mode takes only the whole device qublk "
+			        "exports (/dev/ublkbN)\n",
 			        fd);
 			return opends_err(OPENDS_INVALID_VALUE);
 		}
 		if (ioctl(fd, BLKGETSIZE64, &raw_nbytes) < 0)
 			return opends_err(OPENDS_INVALID_VALUE);
-		if (raw_nbytes == 0 ||
-		    (drv->ns_nbytes && raw_nbytes > drv->ns_nbytes)) {
+		if (raw_nbytes == 0 || drv->ns_nbytes == 0 ||
+		    raw_nbytes > drv->ns_nbytes) {
 			fprintf(stderr,
 			        "aisio: fd %d is %" PRIu64
 			        " bytes, namespace is "

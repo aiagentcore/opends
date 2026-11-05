@@ -13,7 +13,10 @@
  * with the disk.
  *
  * Also checks the gate: with OPENDS_AISIO_RAW_BLOCK unset a block device fd
- * is refused at registration.
+ * is refused at registration, and with it set a block device other than the
+ * ublk disk is refused too. The suite runs the test under
+ * tasks/steps/with_loop_dev.sh, which names a loop device for that check in
+ * OPENDS_TEST_FOREIGN_BLKDEV; without the variable the check is skipped.
  *
  * usage: test_raw_block_aisio <raw_block_dev> <pattern_path_on_mount>
  */
@@ -141,6 +144,33 @@ main(int argc, char **argv)
 		aisio_homi_teardown(&a);
 		close(raw_fd);
 		return 1;
+	}
+
+	/* ---- 2b. Raw mode on: a block device other than the ublk disk is
+	 * refused, since its offsets are not the namespace's LBAs. ---- */
+	const char *foreign = getenv("OPENDS_TEST_FOREIGN_BLKDEV");
+	int foreign_fd = foreign ? open(foreign, O_RDWR | O_DIRECT) : -1;
+	if (!foreign) {
+		fprintf(stderr, "foreign block device: skipped "
+		                "(OPENDS_TEST_FOREIGN_BLKDEV unset)\n");
+	} else if (foreign_fd < 0) {
+		fprintf(stderr, "open(%s): %s\n", foreign, strerror(errno));
+		failed++;
+	} else {
+		opends_handle_t ffh = NULL;
+		err = opends_handle_register(&ffh, foreign_fd);
+		if (err.err != OPENDS_INVALID_VALUE) {
+			fprintf(stderr,
+			        "foreign block device %s not refused "
+			        "(err %d)\n",
+			        foreign, err.err);
+			if (err.err == OPENDS_SUCCESS)
+				opends_handle_deregister(ffh);
+			failed++;
+		} else {
+			fprintf(stderr, "foreign block device refused ok\n");
+		}
+		close(foreign_fd);
 	}
 
 	uint64_t dev_nbytes = 0;

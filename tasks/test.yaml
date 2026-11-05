@@ -195,11 +195,13 @@ steps:
     run: |
       # Raw block mode: register the ublk device qublk exports (its path is
       # recorded by homi_stack_up) and read/write namespace offsets directly.
-      # The test toggles OPENDS_AISIO_RAW_BLOCK itself to check the gate.
+      # The test toggles OPENDS_AISIO_RAW_BLOCK itself to check the gate, and
+      # with_loop_dev.sh hands it a loop device that raw mode must refuse.
       . '{{ config.test.repo_path }}/tasks/steps/install_prefix.sh' '{{ config.deps.install_prefix | default("/usr/local") }}' && \
         OPENDS_XAL_SHM=/xal_dev0 \
         OPENDS_HOMI_MNT='{{ config.test.mount_point }}' \
         OPENDS_AISIO_RAW_BLOCK=1 \
+        '{{ config.test.repo_path }}/tasks/steps/with_loop_dev.sh' \
         '{{ config.test.build_dir }}/test_raw_block_aisio' \
           "$(cat /run/homi/ublk_dev)" \
           '{{ config.test.mount_point }}/opends_tests/sync_read_pattern.bin'

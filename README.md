@@ -174,8 +174,10 @@ the test suite.
   otherwise they fail with `OPENDS_INVALID_VALUE` and nothing is written. The
   fd must be open for writing. Like reads, a write is short at the end of the
   device.
-- Partitions are refused (their offset 0 is not LBA 0), as is a device larger
-  than the namespace.
+- Only the ublk device qublk exports is accepted. Any other block device is
+  refused, since its offsets are not the namespace's LBAs: another disk, a
+  loop or dm device, or a partition (its offset 0 is not LBA 0). So is a
+  device larger than the namespace.
 - Raw writes bypass the kernel, homi and xal-server. Do not write to LBAs a
   mounted filesystem owns: the filesystem and its page cache will not see the
   change.
