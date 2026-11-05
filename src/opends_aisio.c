@@ -641,22 +641,6 @@ resolve_extents(struct driver *d, struct registered_file *h,
 	ssize_t plen;
 	int rc;
 
-	/* A raw handle is one extent spanning the whole device: offset 0 of
-	 * the exported block device is LBA 0 of the namespace, which is the
-	 * same identity the xal-server index relies on. The caller frees it
-	 * like a resolved list. */
-	if (h->raw) {
-		struct ds_extent *ex = calloc(1, sizeof(*ex));
-		if (!ex)
-			return -ENOMEM;
-		ex->file_offset = 0;
-		ex->slba = 0;
-		ex->length = h->raw_nbytes;
-		*out = ex;
-		*out_n = 1;
-		return 0;
-	}
-
 	snprintf(fdpath, sizeof(fdpath), "/proc/self/fd/%d", h->fd);
 	plen = readlink(fdpath, path, sizeof(path) - 1);
 	if (plen < 0)
@@ -986,10 +970,14 @@ start_io_op(struct io_worker *w, struct file_op *op)
 		return;
 	}
 
-	struct ds_extent *extents;
-	uint32_t extent_count;
-	int frc = resolve_extents(d, op->h, &extents, &extent_count);
-	if (frc < 0) {
+	/* A raw handle is one extent spanning the whole device: offset 0 of
+	 * the exported block device is LBA 0 of the namespace, the same
+	 * identity the xal-server index relies on. */
+	struct ds_extent raw_ext = {0, 0, op->h->raw_nbytes};
+	struct ds_extent *extents = &raw_ext;
+	uint32_t extent_count = 1;
+	if (!op->h->raw &&
+	    resolve_extents(d, op->h, &extents, &extent_count) < 0) {
 		op->err = OPENDS_FS_SETUP_ERROR;
 		return;
 	}
@@ -1058,7 +1046,8 @@ start_io_op(struct io_worker *w, struct file_op *op)
 		}
 	}
 out:
-	free(extents);
+	if (extents != &raw_ext)
+		free(extents);
 }
 
 static void
