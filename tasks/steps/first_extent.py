@@ -15,8 +15,10 @@ import sys
 
 FS_IOC_FIEMAP = 0xC020660B
 FIEMAP_FLAG_SYNC = 1
-FIEMAP_EXTENT_UNWRITTEN = 0x800
-FIEMAP_EXTENT_DELALLOC = 0x4
+# The extent is the file's bytes on disk only when none of these is set: the
+# same rule as TEST_FIEMAP_NOT_PLAIN in tests/test_fiemap.h (unknown,
+# delalloc, encoded, encrypted, not aligned, inline, tail, unwritten).
+FIEMAP_NOT_PLAIN = 0x2 | 0x4 | 0x8 | 0x80 | 0x100 | 0x200 | 0x400 | 0x800
 
 with open(sys.argv[1], "rb") as f:
     n = 8
@@ -28,6 +30,6 @@ with open(sys.argv[1], "rb") as f:
         sys.exit("no extents mapped for %s" % sys.argv[1])
     logical, physical, length = struct.unpack_from("QQQ", buf, 32)
     flags = struct.unpack_from("I", buf, 32 + 40)[0]
-    if logical != 0 or flags & (FIEMAP_EXTENT_UNWRITTEN | FIEMAP_EXTENT_DELALLOC):
+    if logical != 0 or flags & FIEMAP_NOT_PLAIN:
         sys.exit("first extent of %s is not a plain written extent at 0" % sys.argv[1])
     print(physical, length)

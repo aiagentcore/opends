@@ -32,13 +32,13 @@
 
 #include "opends.h"
 #include "test_cuda_common.h"
+#include "test_fiemap.h"
 
 #include <cuda.h>
 
 #include <errno.h>
 #include <fcntl.h>
 #include <inttypes.h>
-#include <linux/fiemap.h>
 #include <linux/fs.h>
 #include <stdbool.h>
 #include <stdint.h>
@@ -99,41 +99,31 @@ sync_streams(unsigned n)
 static int
 largest_extent(int fd, struct region *out)
 {
-	size_t sz = sizeof(struct fiemap) +
-	            MAX_EXTENTS * sizeof(struct fiemap_extent);
-	struct fiemap *fm = calloc(1, sz);
-	if (!fm)
+	struct test_extent *ext = calloc(MAX_EXTENTS, sizeof(*ext));
+	if (!ext)
 		return -ENOMEM;
-	fm->fm_start = 0;
-	fm->fm_length = FIEMAP_MAX_OFFSET;
-	fm->fm_flags = FIEMAP_FLAG_SYNC;
-	fm->fm_extent_count = MAX_EXTENTS;
-	if (ioctl(fd, FS_IOC_FIEMAP, fm) < 0) {
-		int rc = -errno;
-		free(fm);
-		return rc;
+	bool complete;
+	int n = test_fiemap(fd, ext, MAX_EXTENTS, &complete);
+	if (n < 0) {
+		free(ext);
+		return n;
 	}
-	uint32_t n = fm->fm_mapped_extents;
 	out->len = 0;
-	for (uint32_t i = 0; i < n; i++) {
-		const struct fiemap_extent *fe = &fm->fm_extents[i];
-		if (fe->fe_flags &
-		    (FIEMAP_EXTENT_UNWRITTEN | FIEMAP_EXTENT_DELALLOC |
-		     FIEMAP_EXTENT_ENCODED | FIEMAP_EXTENT_DATA_INLINE))
-			continue;
-		if (fe->fe_length > out->len) {
-			out->file_off = fe->fe_logical;
-			out->dev_off = fe->fe_physical;
-			out->len = fe->fe_length;
+	for (int i = 0; i < n; i++) {
+		if (ext[i].plain && ext[i].len > out->len) {
+			out->file_off = ext[i].file_off;
+			out->dev_off = ext[i].dev_off;
+			out->len = ext[i].len;
 		}
 	}
-	free(fm);
+	free(ext);
 	if (out->len == 0)
 		return -ENOENT;
 	fprintf(stderr,
-	        "file has %u extent(s); largest %" PRIu64 " bytes at "
+	        "file has %d extent(s)%s; largest %" PRIu64 " bytes at "
 	        "file offset %" PRIu64 ", device offset %" PRIu64 "\n",
-	        n, out->len, out->file_off, out->dev_off);
+	        n, complete ? "" : " or more", out->len, out->file_off,
+	        out->dev_off);
 	return 0;
 }
 

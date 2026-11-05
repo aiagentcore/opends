@@ -22,6 +22,7 @@
 #include "read_pattern.h"
 #include "test_aisio_homi.h"
 #include "test_cuda_common.h"
+#include "test_fiemap.h"
 #include "test_raw_block.h"
 
 #include <cuda.h>
@@ -29,7 +30,6 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <inttypes.h>
-#include <linux/fiemap.h>
 #include <linux/fs.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -40,51 +40,24 @@
 
 #define MAX_EXTENTS 64
 
-/* One extent of the pattern file: where it sits in the file and on disk. */
-struct ext {
-	uint64_t file_off;
-	uint64_t dev_off;
-	uint64_t len;
-};
-
+/* The pattern file's extents, each plain written data and clamped to the
+ * file size. */
 static int
-fiemap_pattern(int fd, struct ext *out, uint32_t *n_out)
+pattern_extents(int fd, struct test_extent *out, uint32_t *n_out)
 {
-	size_t sz = sizeof(struct fiemap) +
-	            MAX_EXTENTS * sizeof(struct fiemap_extent);
-	struct fiemap *fm = calloc(1, sz);
-	if (!fm)
-		return -ENOMEM;
-	fm->fm_start = 0;
-	fm->fm_length = FIEMAP_MAX_OFFSET;
-	fm->fm_flags = FIEMAP_FLAG_SYNC;
-	fm->fm_extent_count = MAX_EXTENTS;
-	if (ioctl(fd, FS_IOC_FIEMAP, fm) < 0) {
-		int rc = -errno;
-		free(fm);
-		return rc;
-	}
-	uint32_t n = fm->fm_mapped_extents;
-	if (n == 0 || !(fm->fm_extents[n - 1].fe_flags & FIEMAP_EXTENT_LAST)) {
-		free(fm);
+	bool complete;
+	int n = test_fiemap(fd, out, MAX_EXTENTS, &complete);
+	if (n < 0)
+		return n;
+	if (!complete)
 		return -E2BIG;
-	}
-	for (uint32_t i = 0; i < n; i++) {
-		const struct fiemap_extent *fe = &fm->fm_extents[i];
-		if (fe->fe_flags &
-		    (FIEMAP_EXTENT_UNWRITTEN | FIEMAP_EXTENT_DELALLOC |
-		     FIEMAP_EXTENT_ENCODED | FIEMAP_EXTENT_DATA_INLINE)) {
-			free(fm);
+	for (int i = 0; i < n; i++) {
+		if (!out[i].plain)
 			return -ENOTSUP;
-		}
-		out[i].file_off = fe->fe_logical;
-		out[i].dev_off = fe->fe_physical;
-		out[i].len = fe->fe_length;
 		if (out[i].file_off + out[i].len > FILE_SIZE)
 			out[i].len = FILE_SIZE - out[i].file_off;
 	}
-	free(fm);
-	*n_out = n;
+	*n_out = (uint32_t)n;
 	return 0;
 }
 
@@ -92,7 +65,7 @@ fiemap_pattern(int fd, struct ext *out, uint32_t *n_out)
  * and read it back. Returns 0 when the page holds the pattern again. */
 static int
 restore_page(opends_handle_t fh, void *gpu, unsigned char *host,
-             const struct ext *e)
+             const struct test_extent *e)
 {
 	unsigned char *img = malloc(PAGE);
 	if (!img)
@@ -176,9 +149,9 @@ main(int argc, char **argv)
 		failed++;
 	}
 
-	struct ext ext[MAX_EXTENTS];
+	struct test_extent ext[MAX_EXTENTS];
 	uint32_t n_ext = 0;
-	int frc = fiemap_pattern(a.fd, ext, &n_ext);
+	int frc = pattern_extents(a.fd, ext, &n_ext);
 	if (frc < 0) {
 		fprintf(stderr, "FIEMAP(%s): %s\n", pattern_path,
 		        strerror(-frc));
