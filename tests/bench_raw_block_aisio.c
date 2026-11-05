@@ -172,10 +172,21 @@ run_leg(opends_handle_t fh, enum mode mode, bool write, uint8_t *buf,
 		break;
 
 	case MODE_ASYNC: {
+		/* pending[s]: slot s holds a submitted op not awaited yet. Only
+		 * those are awaited, so a failed submit or await ends the leg
+		 * without waiting on a future that never started. */
 		opends_async_future_t *fut = calloc(qd, sizeof(*fut));
+		bool *pending = calloc(qd, sizeof(*pending));
+		if (!fut || !pending) {
+			fprintf(stderr, "  async: out of memory\n");
+			free(fut);
+			free(pending);
+			return -1;
+		}
 		for (unsigned i = 0; i < nchunks && rc == 0; i++) {
 			unsigned slot = i % qd;
-			if (i >= qd) {
+			if (pending[slot]) {
+				pending[slot] = false;
 				ssize_t n = opends_async_await(&fut[slot]);
 				if (n != (ssize_t)chunk) {
 					fprintf(stderr, "  async op %u: %zd\n",
@@ -195,16 +206,21 @@ run_leg(opends_handle_t fh, enum mode mode, bool write, uint8_t *buf,
 				fprintf(stderr, "  async submit %u: %s\n", i,
 				        opends_op_status_error(err.err));
 				rc = -1;
+			} else {
+				pending[slot] = true;
 			}
 		}
-		unsigned tail = nchunks < qd ? nchunks : qd;
-		for (unsigned i = nchunks - tail; i < nchunks; i++) {
-			ssize_t n = opends_async_await(&fut[i % qd]);
+		for (unsigned s = 0; s < qd; s++) {
+			if (!pending[s])
+				continue;
+			ssize_t n = opends_async_await(&fut[s]);
 			if (n != (ssize_t)chunk && rc == 0) {
-				fprintf(stderr, "  async op %u: %zd\n", i, n);
+				fprintf(stderr, "  async op in slot %u: %zd\n",
+				        s, n);
 				rc = -1;
 			}
 		}
+		free(pending);
 		free(fut);
 		break;
 	}
