@@ -170,10 +170,12 @@ the test suite.
 - Reads follow the alignment rules of a file read (see `opends.h`): any
   size, a start off an LBA boundary on a 4-byte boundary when the read spans
   whole LBAs, and short at the end of the device.
-- Writes go GPU to NVMe as P2P DMA and must start and end on an LBA boundary;
+- Writes go GPU to NVMe as P2P DMA. They must start and end on an LBA
+  boundary, read from a GPU address on a 4-byte boundary (an NVMe PRP rule;
+  writes have no bounce path) and start before the end of the device;
   otherwise they fail with `OPENDS_INVALID_VALUE` and nothing is written. The
-  fd must be open for writing. Like reads, a write is short at the end of the
-  device.
+  fd must be open for writing. Like reads, a write that crosses the end of the
+  device is short.
 - Only the ublk device qublk exports is accepted. Any other block device is
   refused, since its offsets are not the namespace's LBAs: another disk, a
   loop or dm device, or a partition (its offset 0 is not LBA 0). So is a

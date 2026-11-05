@@ -88,6 +88,30 @@ restore_page(opends_handle_t fh, void *gpu, unsigned char *host,
 	return 0;
 }
 
+/* A raw write of n zero bytes from gpu + buf_off to dev_off that must be
+ * refused before anything reaches the device: it returns
+ * OPENDS_INVALID_VALUE and the first page of extent e still holds the
+ * pattern. Restores the page when it does not. Returns the failure count. */
+static int
+expect_refused_write(opends_handle_t fh, void *gpu, unsigned char *host,
+                     const struct test_extent *e, size_t n, uint64_t dev_off,
+                     off_t buf_off, const char *what)
+{
+	cuda_buf_zero(gpu, n + (size_t)buf_off);
+	ssize_t w = opends_sync_write(fh, gpu, n, (off_t)dev_off, buf_off);
+	ssize_t r = raw_read(fh, gpu, host, PAGE, e->dev_off);
+	size_t bad = r == PAGE ? check_pattern(host, e->file_off, PAGE) : PAGE;
+	if (w == -(ssize_t)OPENDS_INVALID_VALUE && !bad) {
+		fprintf(stderr, "%s raw write refused ok\n", what);
+		return 0;
+	}
+	fprintf(stderr,
+	        "%s raw write: returned %zd (want %d), %zu byte(s) of the "
+	        "first page changed\n",
+	        what, w, -OPENDS_INVALID_VALUE, bad);
+	return bad && restore_page(fh, gpu, host, e) < 0 ? 2 : 1;
+}
+
 int
 main(int argc, char **argv)
 {
@@ -367,59 +391,23 @@ main(int argc, char **argv)
 	}
 stream_done:
 
-	/* ---- 7. Unaligned raw writes are refused, nothing written. ---- */
-	{
-		/* Start off an LBA boundary. */
-		cuda_buf_zero(gpu, PAGE);
-		ssize_t w = opends_sync_write(raw_fh, gpu, PAGE,
-		                              (off_t)(ext[0].dev_off + 1), 0);
-		ssize_t r = raw_read(raw_fh, gpu, host, PAGE, ext[0].dev_off);
-		if (w != -(ssize_t)OPENDS_INVALID_VALUE || r != PAGE ||
-		    check_pattern(host, ext[0].file_off, PAGE)) {
-			fprintf(stderr,
-			        "unaligned-start raw write: returned "
-			        "%zd (want %d), pattern intact=%s\n",
-			        w, -OPENDS_INVALID_VALUE,
-			        r == PAGE ? "yes" : "no");
-			failed++;
-			if (restore_page(raw_fh, gpu, host, &ext[0]) < 0)
-				failed++;
-		} else {
-			fprintf(stderr,
-			        "unaligned-start raw write refused ok\n");
-		}
+	/* ---- 7. Raw writes that break a write rule are refused before
+	 * anything is written: a start off an LBA boundary, an end off one
+	 * (the first page must still hold the pattern afterwards), and a GPU
+	 * source off a 4-byte boundary. ---- */
+	failed +=
+	        expect_refused_write(raw_fh, gpu, host, &ext[0], PAGE,
+	                             ext[0].dev_off + 1, 0, "unaligned-start");
+	if (ext[0].len >= PAGE + 1)
+		failed += expect_refused_write(raw_fh, gpu, host, &ext[0],
+		                               PAGE + 1, ext[0].dev_off, 0,
+		                               "unaligned-end");
+	failed += expect_refused_write(raw_fh, gpu, host, &ext[0], PAGE,
+	                               ext[0].dev_off, 1, "unaligned-source");
 
-		/* Start on an LBA boundary, end off one. The whole op must be
-		 * refused before anything reaches the device: the first page
-		 * must still hold the pattern afterwards. */
-		size_t n = PAGE + 1;
-		if (ext[0].len >= n) {
-			cuda_buf_zero(gpu, n);
-			w = opends_sync_write(raw_fh, gpu, n,
-			                      (off_t)ext[0].dev_off, 0);
-			r = raw_read(raw_fh, gpu, host, PAGE, ext[0].dev_off);
-			size_t bad =
-			        r == PAGE ? check_pattern(host, ext[0].file_off,
-			                                  PAGE)
-			                  : PAGE;
-			if (w != -(ssize_t)OPENDS_INVALID_VALUE || bad) {
-				fprintf(stderr,
-				        "unaligned-end raw write: returned %zd "
-				        "(want %d), %zu byte(s) of the first "
-				        "page changed\n",
-				        w, -OPENDS_INVALID_VALUE, bad);
-				failed++;
-				if (bad && restore_page(raw_fh, gpu, host,
-				                        &ext[0]) < 0)
-					failed++;
-			} else {
-				fprintf(stderr,
-				        "unaligned-end raw write refused ok\n");
-			}
-		}
-	}
-
-	/* ---- 8. Reads at and past the end of the device. ---- */
+	/* ---- 8. The end of the device: a read across it is short, one past
+	 * it returns 0, and a write past it is refused (nothing is there to
+	 * write to, so the check cannot touch data). ---- */
 	if (dev_nbytes >= 2 * PAGE) {
 		ssize_t r = raw_read(raw_fh, gpu, host, 2 * PAGE,
 		                     dev_nbytes - PAGE);
@@ -433,6 +421,16 @@ stream_done:
 			failed++;
 		} else {
 			fprintf(stderr, "end-of-device reads ok\n");
+		}
+		ssize_t w = opends_sync_write(raw_fh, gpu, PAGE,
+		                              (off_t)dev_nbytes, 0);
+		if (w != -(ssize_t)OPENDS_INVALID_VALUE) {
+			fprintf(stderr,
+			        "write past the end: returned %zd (want %d)\n",
+			        w, -OPENDS_INVALID_VALUE);
+			failed++;
+		} else {
+			fprintf(stderr, "write past the end refused ok\n");
 		}
 	}
 

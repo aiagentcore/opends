@@ -56,8 +56,9 @@
  *   be partial. Both violations fail with OPENDS_INVALID_VALUE. With
  *   OPENDS_AISIO_ASSUME_ALIGNED_ONLY set, every read must be fully
  *   LBA-aligned. A write to a raw block handle (OPENDS_AISIO_RAW_BLOCK)
- *   must start and end on an LBA boundary; one that does not fails with
- *   OPENDS_INVALID_VALUE and writes nothing.
+ *   must start and end on an LBA boundary, read from a GPU address on a
+ *   4-byte boundary and start before the end of the device; one that
+ *   does not fails with OPENDS_INVALID_VALUE and writes nothing.
  */
 #ifndef OPENDS_H_
 #define OPENDS_H_

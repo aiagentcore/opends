@@ -923,9 +923,10 @@ submit_partial(struct io_worker *w, struct file_op *op, uint8_t *abs_dst,
 
 /* Resolve the op's extents and submit it. Reads for any handle; writes only
  * for raw handles (filesystem writes take dispatch_write). A write must be
- * LBA-aligned at both ends: there is no read-modify-write path, and it is
- * checked before anything is submitted, so a refused write leaves the device
- * untouched. */
+ * LBA-aligned at both ends, its GPU source on a 4-byte boundary and its start
+ * before the end of the device: there is no read-modify-write or bounce path
+ * for writes, and all of it is checked before anything is submitted, so a
+ * refused write leaves the device untouched. */
 static void
 start_io_op(struct io_worker *w, struct file_op *op)
 {
@@ -966,6 +967,21 @@ start_io_op(struct io_worker *w, struct file_op *op)
 	}
 	uint64_t req_end = req_start + size;
 	if (op->is_write && ((req_start | size) & (d->lba_size - 1))) {
+		op->err = OPENDS_INVALID_VALUE;
+		return;
+	}
+	/* NVMe takes the source address as a PRP entry, whose offset must be
+	 * dword aligned; a misaligned one fails or shifts the data on the
+	 * controller, possibly after earlier chunks were written. */
+	if (op->is_write &&
+	    ((uintptr_t)dst_base & (NVME_PRP_OFFSET_ALIGN - 1))) {
+		op->err = OPENDS_INVALID_VALUE;
+		return;
+	}
+	/* A device has no end of file for a write to grow into: one that
+	 * starts at or past the end fails, as a write to a block device does,
+	 * instead of returning 0. One that crosses the end is short. */
+	if (op->is_write && size && req_start >= op->h->raw_nbytes) {
 		op->err = OPENDS_INVALID_VALUE;
 		return;
 	}
