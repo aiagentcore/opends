@@ -203,6 +203,7 @@ struct driver {
 	pthread_mutex_t submit_lock;
 	pthread_mutex_t reg_lock;
 	pthread_mutex_t alloc_lock;
+	pthread_mutex_t attach_lock;
 	bool stop;
 };
 
@@ -1455,18 +1456,22 @@ xal_attach(struct driver *d)
 /* Attach to the extent index on the first regular-file registration rather
  * than at driver open: a raw block handle needs no index, so a process that
  * registers only block devices runs with homi and qublk alone, no mounted
- * filesystem and no xal-server. Serialized by reg_lock; the registering
- * thread publishes the handle after this returns, and an I/O thread reads
- * d->xal only for an op on a registered file, so it sees the attach. */
+ * filesystem and no xal-server. Serialized by attach_lock, not reg_lock:
+ * xal_attach can wait up to ATTACH_RETRIES * ATTACH_BACKOFF_US for
+ * xal-server, and every op takes reg_lock to check its buffer, so holding
+ * reg_lock here would stall all I/O already running on raw handles. The
+ * registering thread publishes the handle after this returns, and an I/O
+ * thread reads d->xal only for an op on a registered file, so it sees the
+ * attach. */
 static int
 index_attach(struct driver *d)
 {
 	int rc = 0;
 
-	pthread_mutex_lock(&d->reg_lock);
+	pthread_mutex_lock(&d->attach_lock);
 	if (!d->xal)
 		rc = xal_attach(d);
-	pthread_mutex_unlock(&d->reg_lock);
+	pthread_mutex_unlock(&d->attach_lock);
 	return rc;
 }
 
@@ -1526,11 +1531,13 @@ opends_driver_open(void)
 	pthread_mutex_init(&d->submit_lock, NULL);
 	pthread_mutex_init(&d->reg_lock, NULL);
 	pthread_mutex_init(&d->alloc_lock, NULL);
+	pthread_mutex_init(&d->attach_lock, NULL);
 
 	drv = d;
 
 	int orc = open_device(d);
 	if (orc < 0) {
+		pthread_mutex_destroy(&d->attach_lock);
 		pthread_mutex_destroy(&d->alloc_lock);
 		pthread_mutex_destroy(&d->submit_lock);
 		pthread_mutex_destroy(&d->reg_lock);
@@ -1542,6 +1549,7 @@ opends_driver_open(void)
 	if (arc != 0) {
 		fprintf(stderr, "aisio: workers_setup failed\n");
 		xnvme_dev_close(d->xdev);
+		pthread_mutex_destroy(&d->attach_lock);
 		pthread_mutex_destroy(&d->alloc_lock);
 		pthread_mutex_destroy(&d->submit_lock);
 		pthread_mutex_destroy(&d->reg_lock);
@@ -1574,6 +1582,7 @@ opends_driver_close(void)
 	if (drv->xal)
 		xal_close(drv->xal);
 
+	pthread_mutex_destroy(&drv->attach_lock);
 	pthread_mutex_destroy(&drv->alloc_lock);
 	pthread_mutex_destroy(&drv->submit_lock);
 	pthread_mutex_destroy(&drv->reg_lock);
