@@ -16,6 +16,12 @@
  * Writes go through the kernel-mounted filesystem: the source is staged to a
  * host buffer and pwritten via the fd, so XFS over qublk allocates blocks and
  * writes the data; the file's extents are then re-resolved for later P2P reads.
+ *
+ * Raw block mode (opt-in, OPENDS_AISIO_RAW_BLOCK=1): a handle registered on
+ * the whole-disk block device qublk exports (/dev/ublkbN) has no extents to
+ * resolve: byte offset / lba_size is the namespace LBA. Reads and writes both
+ * run as P2P DMA between GPU memory and the NVMe; raw writes must be
+ * LBA-aligned and never touch the kernel filesystem or the xal-server index.
  */
 
 #define _GNU_SOURCE
@@ -29,6 +35,7 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <inttypes.h>
 #include <limits.h>
 #include <pthread.h>
 #include <sched.h>
@@ -38,10 +45,14 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/ioctl.h>
 #include <sys/stat.h>
+#include <sys/sysmacros.h>
 #include <sys/types.h>
 #include <time.h>
 #include <unistd.h>
+
+#include <linux/fs.h>
 
 #include <libxal.h>
 #include <libxnvme.h>
@@ -83,6 +94,8 @@ struct map_run {
 struct registered_file {
 	int fd;
 	int oflags;
+	bool raw;            /* block-device fd: offset / lba_size is the LBA */
+	uint64_t raw_nbytes; /* device capacity (BLKGETSIZE64); raw only */
 };
 
 struct opends_stream {
@@ -161,12 +174,14 @@ struct io_worker {
 struct driver {
 	char dev_uri[XNVME_IDENT_URI_LEN]; ///< NVMe device the HOMI server owns
 	struct aisio_config cfg;           ///< From the environment at open
-	struct xal *xal; ///< Attach to the index xal-server publishes
+	struct xal *xal; ///< The index xal-server publishes; NULL until a
+	                 ///< regular file is registered (index_attach)
 	struct xnvme_dev *xdev;
 	uint32_t nsid;
 	uint32_t lba_size;
 	uint32_t lba_shift;
 	uint32_t mdts_nbytes;
+	uint64_t ns_nbytes; ///< Namespace capacity, bounds a raw handle
 	struct buf_entry bufs[MAX_BUF_ENTRIES]; ///< Sorted by base
 	int buf_count;
 	size_t chunk_nbytes; ///< Allocation granularity registrations round to
@@ -188,6 +203,7 @@ struct driver {
 	pthread_mutex_t submit_lock;
 	pthread_mutex_t reg_lock;
 	pthread_mutex_t alloc_lock;
+	pthread_mutex_t attach_lock;
 	bool stop;
 };
 
@@ -618,14 +634,14 @@ out:
 }
 
 static int
-resolve_extents(struct driver *d, int fd, struct ds_extent **out,
-                uint32_t *out_n)
+resolve_extents(struct driver *d, struct registered_file *h,
+                struct ds_extent **out, uint32_t *out_n)
 {
 	char fdpath[64], path[PATH_MAX];
 	ssize_t plen;
 	int rc;
 
-	snprintf(fdpath, sizeof(fdpath), "/proc/self/fd/%d", fd);
+	snprintf(fdpath, sizeof(fdpath), "/proc/self/fd/%d", h->fd);
 	plen = readlink(fdpath, path, sizeof(path) - 1);
 	if (plen < 0)
 		return -errno;
@@ -678,6 +694,7 @@ open_device(struct driver *d)
 	d->lba_size = geo->lba_nbytes ? geo->lba_nbytes : geo->nbytes;
 	d->mdts_nbytes =
 	        geo->mdts_nbytes ? geo->mdts_nbytes : DEFAULT_BOUNCE_SIZE;
+	d->ns_nbytes = geo->tbytes;
 
 	if (d->lba_size == 0) {
 		fprintf(stderr,
@@ -721,9 +738,12 @@ chunk_cb(struct xnvme_cmd_ctx *ctx, void *opaque)
 	xnvme_queue_put_cmd_ctx(ctx->async.queue, ctx);
 }
 
+/* Submit the LBA-aligned middle of a span as whole-LBA commands, chunked by
+ * MDTS. Reads land in GPU memory; writes (raw handles only) are sourced from
+ * it. Both directions complete through chunk_cb. */
 static int
-submit_read_middle(struct driver *d, struct read_cursor *c, struct file_op *op,
-                   uint64_t middle_lbas)
+submit_io_middle(struct driver *d, struct read_cursor *c, struct file_op *op,
+                 uint64_t middle_lbas, bool is_write)
 {
 	uint32_t lba_nbytes = d->lba_size;
 	uint64_t max_chunk_lbas = d->mdts_nbytes >> d->lba_shift;
@@ -747,8 +767,10 @@ submit_read_middle(struct driver *d, struct read_cursor *c, struct file_op *op,
 		uint8_t *dst_chunk = c->abs_dst + lbas_done * lba_nbytes;
 
 		op->chunks_remaining++;
-		int srv = xnvme_nvm_read(ctx, d->nsid, chunk_slba, nlb,
-		                         dst_chunk, NULL);
+		int srv = is_write ? xnvme_nvm_write(ctx, d->nsid, chunk_slba,
+		                                     nlb, dst_chunk, NULL)
+		                   : xnvme_nvm_read(ctx, d->nsid, chunk_slba,
+		                                    nlb, dst_chunk, NULL);
 		if (srv == -EBUSY) {
 			op->chunks_remaining--;
 			xnvme_queue_put_cmd_ctx(c->queue, ctx);
@@ -883,13 +905,23 @@ submit_partial(struct io_worker *w, struct file_op *op, uint8_t *abs_dst,
 	return submit_host_bounce(w, op, abs_dst, slba, src_off, nbytes);
 }
 
+/* Resolve the op's extents and submit it. Reads for any handle; writes only
+ * for raw handles (filesystem writes take dispatch_write). A write must be
+ * LBA-aligned at both ends, its GPU source on a 4-byte boundary and its start
+ * before the end of the device: there is no read-modify-write or bounce path
+ * for writes, and all of it is checked before anything is submitted, so a
+ * refused write leaves the device untouched. */
 static void
-start_read_op(struct io_worker *w, struct file_op *op)
+start_io_op(struct io_worker *w, struct file_op *op)
 {
 	struct driver *d = w->drv;
 
 	if (d->lba_size == 0) {
 		op->err = OPENDS_INTERNAL_ERROR;
+		return;
+	}
+	if (op->is_write && (op->h->oflags & O_ACCMODE) == O_RDONLY) {
+		op->err = OPENDS_INVALID_VALUE;
 		return;
 	}
 	if ((d->mdts_nbytes >> d->lba_shift) == 0) {
@@ -918,11 +950,34 @@ start_read_op(struct io_worker *w, struct file_op *op)
 		return;
 	}
 	uint64_t req_end = req_start + size;
+	if (op->is_write && ((req_start | size) & (d->lba_size - 1))) {
+		op->err = OPENDS_INVALID_VALUE;
+		return;
+	}
+	/* NVMe takes the source address as a PRP entry, whose offset must be
+	 * dword aligned; a misaligned one fails or shifts the data on the
+	 * controller, possibly after earlier chunks were written. */
+	if (op->is_write &&
+	    ((uintptr_t)dst_base & (NVME_PRP_OFFSET_ALIGN - 1))) {
+		op->err = OPENDS_INVALID_VALUE;
+		return;
+	}
+	/* A device has no end of file for a write to grow into: one that
+	 * starts at or past the end fails, as a write to a block device does,
+	 * instead of returning 0. One that crosses the end is short. */
+	if (op->is_write && size && req_start >= op->h->raw_nbytes) {
+		op->err = OPENDS_INVALID_VALUE;
+		return;
+	}
 
-	struct ds_extent *extents;
-	uint32_t extent_count;
-	int frc = resolve_extents(d, op->h->fd, &extents, &extent_count);
-	if (frc < 0) {
+	/* A raw handle is one extent spanning the whole device: offset 0 of
+	 * the exported block device is LBA 0 of the namespace, the same
+	 * identity the xal-server index relies on. */
+	struct ds_extent raw_ext = {0, 0, op->h->raw_nbytes};
+	struct ds_extent *extents = &raw_ext;
+	uint32_t extent_count = 1;
+	if (!op->h->raw &&
+	    resolve_extents(d, op->h, &extents, &extent_count) < 0) {
 		op->err = OPENDS_FS_SETUP_ERROR;
 		return;
 	}
@@ -976,7 +1031,8 @@ start_read_op(struct io_worker *w, struct file_op *op)
 			        .abs_dst = abs_dst,
 			        .remaining = remaining,
 			};
-			if (submit_read_middle(d, &c, op, middle_lbas) < 0)
+			if (submit_io_middle(d, &c, op, middle_lbas,
+			                     op->is_write) < 0)
 				goto out;
 			cur_slba = c.cur_slba;
 			abs_dst = c.abs_dst;
@@ -990,7 +1046,8 @@ start_read_op(struct io_worker *w, struct file_op *op)
 		}
 	}
 out:
-	free(extents);
+	if (extents != &raw_ext)
+		free(extents);
 }
 
 static void
@@ -1090,7 +1147,7 @@ dispatch_write(struct io_worker *w, struct file_op *op)
 static void
 dispatch_pending(struct io_worker *w, struct file_op *op)
 {
-	if (op->is_write) {
+	if (op->is_write && !op->h->raw) {
 		dispatch_write(w, op);
 		return;
 	}
@@ -1100,7 +1157,7 @@ dispatch_pending(struct io_worker *w, struct file_op *op)
 	op->err = 0;
 	op->n_bounces = 0;
 	__atomic_store_n(&op->state, FILE_OP_IN_FLIGHT, __ATOMIC_RELEASE);
-	start_read_op(w, op);
+	start_io_op(w, op);
 }
 
 static void
@@ -1401,6 +1458,28 @@ xal_attach(struct driver *d)
 	return rc;
 }
 
+/* Attach to the extent index on the first regular-file registration rather
+ * than at driver open: a raw block handle needs no index, so a process that
+ * registers only block devices runs with homi and qublk alone, no mounted
+ * filesystem and no xal-server. Serialized by attach_lock, not reg_lock:
+ * xal_attach can wait up to ATTACH_RETRIES * ATTACH_BACKOFF_US for
+ * xal-server, and every op takes reg_lock to check its buffer, so holding
+ * reg_lock here would stall all I/O already running on raw handles. The
+ * registering thread publishes the handle after this returns, and an I/O
+ * thread reads d->xal only for an op on a registered file, so it sees the
+ * attach. */
+static int
+index_attach(struct driver *d)
+{
+	int rc = 0;
+
+	pthread_mutex_lock(&d->attach_lock);
+	if (!d->xal)
+		rc = xal_attach(d);
+	pthread_mutex_unlock(&d->attach_lock);
+	return rc;
+}
+
 /* Ask homi which device it holds; -ENOENT and an empty list mean "not yet". */
 static int
 homi_device(struct driver *d)
@@ -1457,21 +1536,13 @@ opends_driver_open(void)
 	pthread_mutex_init(&d->submit_lock, NULL);
 	pthread_mutex_init(&d->reg_lock, NULL);
 	pthread_mutex_init(&d->alloc_lock, NULL);
-
-	int rc = xal_attach(d);
-	if (rc < 0) {
-		pthread_mutex_destroy(&d->alloc_lock);
-		pthread_mutex_destroy(&d->submit_lock);
-		pthread_mutex_destroy(&d->reg_lock);
-		free(d);
-		return opends_err(OPENDS_FS_SETUP_ERROR);
-	}
+	pthread_mutex_init(&d->attach_lock, NULL);
 
 	drv = d;
 
 	int orc = open_device(d);
 	if (orc < 0) {
-		xal_close(d->xal);
+		pthread_mutex_destroy(&d->attach_lock);
 		pthread_mutex_destroy(&d->alloc_lock);
 		pthread_mutex_destroy(&d->submit_lock);
 		pthread_mutex_destroy(&d->reg_lock);
@@ -1483,7 +1554,7 @@ opends_driver_open(void)
 	if (arc != 0) {
 		fprintf(stderr, "aisio: workers_setup failed\n");
 		xnvme_dev_close(d->xdev);
-		xal_close(d->xal);
+		pthread_mutex_destroy(&d->attach_lock);
 		pthread_mutex_destroy(&d->alloc_lock);
 		pthread_mutex_destroy(&d->submit_lock);
 		pthread_mutex_destroy(&d->reg_lock);
@@ -1513,9 +1584,10 @@ opends_driver_close(void)
 
 	if (drv->xdev)
 		xnvme_dev_close(drv->xdev);
+	if (drv->xal)
+		xal_close(drv->xal);
 
-	xal_close(drv->xal);
-
+	pthread_mutex_destroy(&drv->attach_lock);
 	pthread_mutex_destroy(&drv->alloc_lock);
 	pthread_mutex_destroy(&drv->submit_lock);
 	pthread_mutex_destroy(&drv->reg_lock);
@@ -1568,6 +1640,32 @@ opends_get_version(unsigned *major, unsigned *minor, unsigned *patch)
 /*  Handle registration                                               */
 /* ------------------------------------------------------------------ */
 
+/* qublk exports the namespace as the whole disk /dev/ublkbN. Any other block
+ * device (another disk, a loop or dm device, a partition, whose offset 0 is
+ * not LBA 0) has its own LBA space, and a raw handle on it would read and
+ * write the namespace's LBAs instead, so only a ublk disk is accepted. */
+static bool
+is_ublk_disk(dev_t rdev)
+{
+	char link[64], target[PATH_MAX];
+
+	snprintf(link, sizeof(link), "/sys/dev/block/%u:%u", major(rdev),
+	         minor(rdev));
+	ssize_t n = readlink(link, target, sizeof(target) - 1);
+	if (n < 0)
+		return false;
+	target[n] = '\0';
+
+	const char *name = strrchr(target, '/');
+	name = name ? name + 1 : target;
+	if (strncmp(name, "ublkb", 5) != 0 || !name[5])
+		return false;
+	for (const char *c = name + 5; *c; c++)
+		if (*c < '0' || *c > '9')
+			return false;
+	return true;
+}
+
 opends_error_t
 opends_handle_register(opends_handle_t *fh, int fd)
 {
@@ -1582,11 +1680,49 @@ opends_handle_register(opends_handle_t *fh, int fd)
 	if (!(oflags & O_DIRECT))
 		return opends_err(OPENDS_DIO_NOT_SET);
 
+	struct stat st;
+	if (fstat(fd, &st) < 0)
+		return opends_err(OPENDS_INVALID_VALUE);
+	bool raw = S_ISBLK(st.st_mode);
+	uint64_t raw_nbytes = 0;
+	if (!raw && index_attach(drv) < 0)
+		return opends_err(OPENDS_FS_SETUP_ERROR);
+	if (raw) {
+		if (!drv->cfg.raw_block_enabled) {
+			fprintf(stderr,
+			        "aisio: fd %d is a block device; set %s=1 to "
+			        "register it in raw block mode\n",
+			        fd, AISIO_CONFIG_ENV_RAW_BLOCK);
+			return opends_err(OPENDS_INVALID_VALUE);
+		}
+		if (!is_ublk_disk(st.st_rdev)) {
+			fprintf(stderr,
+			        "aisio: fd %d is not a ublk disk; raw block "
+			        "mode takes only the whole device qublk "
+			        "exports (/dev/ublkbN)\n",
+			        fd);
+			return opends_err(OPENDS_INVALID_VALUE);
+		}
+		if (ioctl(fd, BLKGETSIZE64, &raw_nbytes) < 0)
+			return opends_err(OPENDS_INVALID_VALUE);
+		if (raw_nbytes == 0 || drv->ns_nbytes == 0 ||
+		    raw_nbytes > drv->ns_nbytes) {
+			fprintf(stderr,
+			        "aisio: fd %d is %" PRIu64
+			        " bytes, namespace is "
+			        "%" PRIu64 "; not the exported namespace\n",
+			        fd, raw_nbytes, drv->ns_nbytes);
+			return opends_err(OPENDS_INVALID_VALUE);
+		}
+	}
+
 	struct registered_file *h = calloc(1, sizeof(*h));
 	if (!h)
 		return opends_err(OPENDS_INTERNAL_ERROR);
 	h->fd = fd;
 	h->oflags = oflags;
+	h->raw = raw;
+	h->raw_nbytes = raw_nbytes;
 
 	*fh = h;
 	__atomic_fetch_add(&use_count, 1, __ATOMIC_RELAXED);

@@ -1,0 +1,75 @@
+# SPDX-License-Identifier: BSD-3-Clause
+doc: |
+  Raw block mode bench
+  ====================
+
+  Throughput of raw block mode against the file-backed path on the same
+  blocks, with bench_raw_block_aisio. A scratch file is written on the
+  kernel-mounted XFS so xal-server indexes it, the HOMI/qublk/xal-server
+  stack comes up, and the bench reads and writes the file's largest extent
+  through a file handle and through the raw handle of the ublk device, for
+  every I/O family over a chunk size x queue depth sweep. The write legs
+  overwrite the file's blocks; clean removes the file before the stack goes
+  down.
+
+  Prerequisites: scripts/setup_deps.py and scripts/build.py have run on the
+  target and the XFS on the test namespace exists (see test.yaml).
+
+  Run from the workstation: scripts/bench/raw_block.py
+
+steps:
+  - name: check_stack_down
+    run: |
+      '{{ config.test.repo_path }}/tasks/steps/check_stack_down.sh' '{{ config.test.nvme_bdf }}'
+
+  - name: cpu_governor
+    run: |
+      '{{ config.test.repo_path }}/tasks/steps/cpu_governor.sh'
+
+  - name: bind_nvme
+    run: |
+      '{{ config.test.repo_path }}/tasks/steps/bind_nvme.sh' '{{ config.test.nvme_bdf }}'
+
+  - name: mount
+    run: |
+      '{{ config.test.repo_path }}/tasks/steps/mount_nvme.sh' '{{ config.test.nvme_bdf }}' '{{ config.test.mount_point }}'
+
+  - name: bench_prep
+    run: |
+      mkdir -p '{{ config.test.mount_point }}/opends_tests' && \
+        dd if=/dev/urandom \
+          of='{{ config.test.mount_point }}/opends_tests/raw_bench.bin' \
+          bs=1M count={{ (config.bench_raw_block | default({})).region_mib | default(2048) }} \
+          status=none conv=fsync && \
+        xfs_bmap -v '{{ config.test.mount_point }}/opends_tests/raw_bench.bin' | tail -n +2 | head -20
+
+  - name: homi_stack_up
+    run: |
+      . '{{ config.test.repo_path }}/tasks/steps/install_prefix.sh' '{{ config.deps.install_prefix | default("/usr/local") }}' && \
+        '{{ config.test.repo_path }}/tasks/steps/homi_stack_up.sh' '{{ config.test.nvme_bdf }}' '{{ config.test.mount_point }}'
+
+  - name: bench_raw_block
+    run: |
+      . '{{ config.test.repo_path }}/tasks/steps/install_prefix.sh' '{{ config.deps.install_prefix | default("/usr/local") }}' && \
+        OPENDS_XAL_SHM=/xal_dev0 \
+        OPENDS_HOMI_MNT='{{ config.test.mount_point }}' \
+        OPENDS_AISIO_RAW_BLOCK=1 \
+        BENCH_RAW_FIRST={{ (config.bench_raw_block | default({})).raw_first | default(0) }} \
+        timeout 1800 '{{ config.test.build_dir }}/bench_raw_block_aisio' \
+          "$(cat /run/homi/ublk_dev)" \
+          '{{ config.test.mount_point }}/opends_tests/raw_bench.bin' \
+          $(( {{ (config.bench_raw_block | default({})).region_mib | default(2048) }} * 1048576 )) \
+          '{{ (config.bench_raw_block | default({})).chunks | default("65536,262144,1048576,4194304,16777216") }}' \
+          '{{ (config.bench_raw_block | default({})).qds | default("1,8,32") }}'
+
+  - name: clean
+    run: |
+      rm -f '{{ config.test.mount_point }}/opends_tests/raw_bench.bin'
+
+  - name: homi_stack_down
+    run: |
+      '{{ config.test.repo_path }}/tasks/steps/homi_stack_down.sh' '{{ config.test.nvme_bdf }}' '{{ config.test.mount_point }}'
+
+  - name: cpu_governor_restore
+    run: |
+      '{{ config.test.repo_path }}/tasks/steps/cpu_governor.sh' restore
