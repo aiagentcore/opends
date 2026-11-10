@@ -76,6 +76,28 @@ main(int argc, char **argv)
 		cuda_register_release(small);
 	}
 
+	/* A handle outlives the driver, and the driver attaches to the extent
+	 * index when a file is registered: a read through a handle that was
+	 * registered before a close and a reopen must find the index too. */
+	opends_driver_close();
+	opends_error_t err = opends_driver_open();
+	if (err.err != OPENDS_SUCCESS) {
+		fprintf(stderr, "FAIL: driver reopen: %s\n",
+		        opends_op_status_error(err.err));
+		failed++;
+	} else {
+		void *buf = cuda_alloc_acquire(PAGE);
+		int bad = !buf || verify_read(&env_alloc, buf, PAGE, PAGE, 0, 0,
+		                              "read after driver reopen");
+		fprintf(stderr,
+		        "%s: read through a handle kept across a "
+		        "driver reopen\n",
+		        bad ? "FAIL" : "PASS");
+		failed += bad;
+		if (buf)
+			cuda_alloc_release(buf);
+	}
+
 	aisio_homi_teardown(&a);
 
 	if (failed)

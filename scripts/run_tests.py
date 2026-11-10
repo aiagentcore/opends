@@ -21,7 +21,7 @@ TESTS_BY_BACKEND = {
     "aisio": ["sync_read", "mt_read", "register_large", "coherency",
               "async_read", "async_read_busy_spin", "batch_read",
               "stream_read", "stream_read_busy_spin", "sync_write",
-              "stream_write", "python"],
+              "stream_write", "python", "raw_block", "raw_block_bare"],
 }
 ALL_TESTS = sorted({t for ts in TESTS_BY_BACKEND.values() for t in ts})
 
@@ -54,16 +54,26 @@ def _steps_for(backends, tests):
         if b == "aisio":
             continue
         steps.append(f"test_{t}_{b}")
+    bare = ("aisio", "raw_block_bare") in selected
     if needs_stack:
         # Hand the controller to HOMI, expose it via qublk, remount the
         # same XFS, run the aisio tests against it, then restore nvme.
         steps.append("homi_stack_up")
         for b, t in selected:
-            if b == "aisio":
+            if b == "aisio" and t != "raw_block_bare":
                 steps.append(f"test_{t}_{b}")
+    if bare:
+        # Writes its scratch file while the file system is mounted.
+        steps.append("raw_block_bare_prep")
     steps.append("clean_test_dir")
+    if bare:
+        # Drop the file system and xal-server, keep homi + qublk, test
+        # against the bare device.
+        steps += ["homi_stack_bare", "test_raw_block_bare_aisio"]
     if needs_stack:
         steps.append("homi_stack_down")
+    if bare:
+        steps.append("raw_block_bare_clean")
     return steps
 
 

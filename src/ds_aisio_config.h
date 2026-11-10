@@ -23,6 +23,8 @@ struct aisio_config {
 	bool busy_spin;
 	uint64_t cpu_mask;
 	bool assume_aligned_only;
+	bool raw_block_enabled; ///< OPENDS_AISIO_RAW_BLOCK=1: block device fds
+	                        ///< may be registered (raw block mode)
 	size_t host_heap_nbytes;
 	size_t device_heap_nbytes;
 };

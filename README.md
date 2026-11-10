@@ -84,7 +84,9 @@ kernel over the bytes and a copy back on one CUDA stream.
   controller up. The driver joins that group as a secondary and allocates its
   own I/O queues. File extents come from the index xal-server publishes over
   POSIX shared memory, built over the qublk-exported block device. Reads and
-  writes are supported. Requires xNVMe, xal, and the CUDA toolkit.
+  writes are supported. A handle can also be that block device itself (raw
+  block mode, below), with reads and writes as P2P DMA at namespace offsets.
+  Requires xNVMe, xal, and the CUDA toolkit.
 
 ## OpenDS AiSIO configuration
 
@@ -93,7 +95,14 @@ The AiSIO backend reads its configuration from environment variables at
 the open.
 
 - `OPENDS_XAL_SHM`: Shared-memory name of the xal-server extent index.
-  Default `/xal_dev0`.
+  Default `/xal_dev0`. The driver attaches to it when the first regular file
+  is registered, not at open, so a process that registers only block devices
+  (raw block mode, below) needs no xal-server. A file handle kept across
+  `opends_driver_close()` and `opends_driver_open()` attaches at its next
+  I/O, with the same wait and the same error. Registering a file while no
+  index is published fails with `OPENDS_FS_SETUP_ERROR` after a minute of
+  retries; registrations after that fail at once until the driver is closed
+  and opened again.
 - `OPENDS_AISIO_IO_THREADS`: Number of internal IO worker threads. Default 2.
   Driver open creates one NVMe queue per worker.
 - `OPENDS_AISIO_QUEUE_DEPTH`: xNVMe queue depth per worker. Default 8.
@@ -119,6 +128,8 @@ the open.
   every process in the group shares, so xNVMe's 1 GiB default is too large.
 - `OPENDS_AISIO_DEVICE_HEAP_MB`: GPU device heap for this process. Default 0,
   which leaves it at the xNVMe default.
+- `OPENDS_AISIO_RAW_BLOCK`: `1` allows raw block mode (below). Default off:
+  registering a block device fd fails with `OPENDS_INVALID_VALUE`.
 
 ### Writes and the extent index
 
@@ -140,11 +151,53 @@ blocks that were allocated at index time usually reads back correctly, but
 XFS does not promise it, and OpenDS does not check it.
 
 To read written data through OpenDS, restart xal-server after the writes so it
-indexes again. A process that opened the driver before the restart stays on the
+indexes again. A process that registered a file before the restart stays on the
 old index: its next read fails with `OPENDS_FS_SETUP_ERROR` after five seconds,
 and it must call `opends_driver_close()` and `opends_driver_open()` to attach to
 the new index. This restriction is temporary: a re-index on request is being
 pursued in xal-server, and the restriction goes when it lands.
+
+### Raw block mode
+
+With `OPENDS_AISIO_RAW_BLOCK=1`, `opends_handle_register` accepts the
+whole-disk block device qublk exports for the namespace (`/dev/ublkbN`,
+opened with `O_DIRECT`). On such a handle `file_offset` is the byte offset on
+the namespace: `file_offset / lba_size` is the LBA, with no filesystem or
+extent lookup in the path. All I/O families work: sync, async, stream and
+batch. Regular files can be
+registered on the same driver at the same time. The extent-index restriction
+above does not apply to a raw handle: nothing is looked up, so a raw read sees
+what is on the namespace now.
+
+The minimal stack for raw block mode is `homi serve` and `qublk serve`: no
+file system on the namespace, no mount and no xal-server. This is the
+uGDS-style use, a KV cache for instance, where the process owns the block
+device and lays it out itself. `test_raw_block_bare_aisio` runs that way in
+the test suite.
+
+- Reads follow the alignment rules of a file read (see `opends.h`): any size
+  and start, through the kernel (the ublk device) when the whole LBAs would
+  land off a 4-byte boundary in GPU memory, and short at the end of the
+  device.
+- Writes go GPU to NVMe as P2P DMA. They must start and end on an LBA
+  boundary, read from a GPU address on a 4-byte boundary (an NVMe PRP rule;
+  writes have no bounce path) and, unless empty, start before the end of the
+  device; otherwise they fail with `OPENDS_INVALID_VALUE` and nothing is
+  written. Like reads, a write that crosses the end of the device is short.
+- The access mode of the fd holds, though raw I/O never passes the kernel: a
+  write on a read-only fd and a read on a write-only fd fail with
+  `OPENDS_INVALID_VALUE`.
+- Only the ublk disk qublk exports for the namespace this driver opened is
+  accepted. Any other block device is refused, since its offsets are not the
+  namespace's LBAs: another disk, a loop or dm device, a partition (its offset
+  0 is not LBA 0), or another ublk disk. The driver tells its own disk by the
+  NVMe ioctl device qublk serves beside it (`/dev/ublkbN-nvme`), which must
+  report the same controller serial number and namespace id; the sizes must
+  match too. Raw block mode therefore needs that device: qublk built with
+  CUSE, the `cuse` module loaded, and no `--no-cuse`.
+- Raw writes bypass the kernel, homi and xal-server. Do not write to LBAs a
+  mounted filesystem owns: the filesystem and its page cache will not see the
+  change.
 
 ## Performance
 
@@ -166,6 +219,38 @@ _Commit `93fd019` (kernel `6.8.12-dmabuf`, NVMe `Samsung S4LV008[Pascal]`, GPU
 | lmcacheish    | sync   |           5533 |           6151 |
 | lmcacheish    | stream |           4991 |           5368 |
 | lmcacheish    | async  |              - |           5384 |
+
+### Raw block mode against files
+
+_Measured 2026-11-10 on the driver of this section (kernel `6.8.12-dmabuf`,
+NVMe `Samsung SSD 990 PRO 1TB`, GPU `NVIDIA RTX PRO 2000 Blackwell`), default
+AiSIO settings. Each leg moves one 2 GiB region; mean of two runs, one with
+the file handle first and one with the raw handle first._
+
+`bench_raw_block_aisio` reads and writes the largest extent of a file through
+a file handle and the same blocks through a raw handle of the ublk device
+(`tasks/bench_raw_block.yaml`, run with `scripts/bench/raw_block.py`; the
+runs below swept chunks of 4 and 16 MiB at queue depths 1 and 8).
+
+| op    | mode   | chunk  | qd | file (MiB/s) | raw (MiB/s) |
+|-------|--------|--------|----|--------------|-------------|
+| read  | sync   |  4 MiB |  1 |         5493 |        5510 |
+| read  | sync   | 16 MiB |  1 |         6616 |        6612 |
+| read  | async  |  4 MiB |  8 |         6952 |        7064 |
+| read  | async  | 16 MiB |  8 |         4917 |        5588 |
+| write | sync   |  4 MiB |  1 |         1014 |        5560 |
+| write | sync   | 16 MiB |  1 |          953 |        6482 |
+| write | async  |  4 MiB |  8 |         3606 |        6613 |
+| write | async  | 16 MiB |  8 |         1291 |        6604 |
+| write | stream |  4 MiB |  8 |         3592 |        6623 |
+
+Reads take the same P2P path either way, so the two handles match. A write to
+a file handle goes through the kernel with a GPU-to-host copy first; a raw
+write is P2P DMA from the GPU. Reads of large chunks at queue depth 8 vary
+from run to run on either handle (the raw 16 MiB async read above was 5157 and
+6020 MiB/s), so read differences in those rows are noise. In the full default
+sweep some read legs also slow down by their position in the run, on whichever
+handle runs there, so compare the handles only over both orders.
 
 ## OpenDS API
 

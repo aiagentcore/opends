@@ -13,8 +13,12 @@ doc: |
   and remounts the same XFS over it, so the sync-read pattern written
   during prep is still present. The aisio tests join HOMI's
   multi-process group and read that pattern file. clean_test_dir removes
-  the files the suite wrote, then homi_stack_down tears the stack down
-  and rebinds nvme so iterative runs leave the target usable.
+  the files the suite wrote. The raw block test for a bare device then
+  runs with the stack reduced to homi + qublk (homi_stack_bare: nothing
+  mounted, no xal-server), against a scratch file's blocks. Finally
+  homi_stack_down tears the stack down and rebinds nvme so iterative runs
+  leave the target usable, and raw_block_bare_clean removes that scratch
+  file.
 
   Prerequisites:
     - setup_opends.yaml has been run (sync_and_build.py does this).
@@ -193,17 +197,78 @@ steps:
 
   - name: test_python_aisio
     run: |
+      # Raw block mode is on for the raw handle check, which reads the
+      # pattern file's first extent through the ublk disk qublk exports. The
+      # two values are fetched first so a failure fails the step: the test
+      # skips the check when they are empty.
       . '{{ config.test.repo_path }}/tasks/steps/install_prefix.sh' '{{ config.deps.install_prefix | default("/usr/local") }}' && \
         cd '{{ config.test.repo_path }}/python' && \
+        raw_dev="$(cat /run/homi/ublk_dev)" && \
+        raw_extent="$(python3 '{{ config.test.repo_path }}/tasks/steps/first_extent.py' '{{ config.test.mount_point }}/opends_tests/sync_read_pattern.bin')" && \
         OPENDS_XAL_SHM=/xal_dev0 \
         OPENDS_HOMI_MNT='{{ config.test.mount_point }}' OPENDS_BACKEND=aisio \
         OPENDS_LIBRARY='{{ config.test.build_dir }}/libopends_aisio.so' \
+        OPENDS_AISIO_RAW_BLOCK=1 OPENDS_TEST_RAW_BLOCK_DEV="$raw_dev" \
+        OPENDS_TEST_RAW_EXTENT="$raw_extent" \
         PYTHONPATH=. python3 tests/test_aisio_cuda.py
+
+  - name: test_raw_block_aisio
+    run: |
+      # Raw block mode: register the ublk device qublk exports (its path is
+      # recorded by homi_stack_up) and read/write namespace offsets directly.
+      # The test toggles OPENDS_AISIO_RAW_BLOCK itself to check the gate, and
+      # with_foreign_blkdevs.sh hands it a loop device and another qublk's
+      # disk, which raw mode must refuse.
+      . '{{ config.test.repo_path }}/tasks/steps/install_prefix.sh' '{{ config.deps.install_prefix | default("/usr/local") }}' && \
+        OPENDS_XAL_SHM=/xal_dev0 \
+        OPENDS_HOMI_MNT='{{ config.test.mount_point }}' \
+        OPENDS_AISIO_RAW_BLOCK=1 \
+        '{{ config.test.repo_path }}/tasks/steps/with_foreign_blkdevs.sh' "$(cat /run/homi/ublk_dev)" \
+        '{{ config.test.build_dir }}/test_raw_block_aisio' \
+          "$(cat /run/homi/ublk_dev)" \
+          '{{ config.test.mount_point }}/opends_tests/sync_read_pattern.bin'
+
+  - name: raw_block_bare_prep
+    run: |
+      # A scratch file, and where its blocks are: the bare-device test writes
+      # into that range once the file system is unmounted. The file stays
+      # until raw_block_bare_clean, so the file system keeps the blocks
+      # allocated to it meanwhile.
+      dd if=/dev/zero \
+        of='{{ config.test.mount_point }}/opends_tests/raw_bare_scratch.bin' \
+        bs=64k count=1 status=none conv=fsync && \
+        python3 '{{ config.test.repo_path }}/tasks/steps/first_extent.py' \
+        '{{ config.test.mount_point }}/opends_tests/raw_bare_scratch.bin' > /run/homi/raw_range && \
+        cat /run/homi/raw_range
 
   - name: clean_test_dir
     run: |
       rm -f '{{ config.test.mount_point }}/opends_tests/sync_read_pattern.bin' '{{ config.test.mount_point }}/opends_tests/coherency_large.bin' '{{ config.test.mount_point }}/opends_tests/write_scratch.bin'
 
+  - name: homi_stack_bare
+    run: |
+      '{{ config.test.repo_path }}/tasks/steps/homi_stack_bare.sh' '{{ config.test.mount_point }}'
+
+  - name: test_raw_block_bare_aisio
+    run: |
+      # No file system, no xal-server: only homi and qublk. The test names
+      # an index of its own for the file-registration check.
+      . '{{ config.test.repo_path }}/tasks/steps/install_prefix.sh' '{{ config.deps.install_prefix | default("/usr/local") }}' && \
+        OPENDS_AISIO_RAW_BLOCK=1 \
+        '{{ config.test.build_dir }}/test_raw_block_bare_aisio' \
+          "$(cat /run/homi/ublk_dev)" $(cat /run/homi/raw_range)
+
   - name: homi_stack_down
     run: |
       '{{ config.test.repo_path }}/tasks/steps/homi_stack_down.sh' '{{ config.test.nvme_bdf }}' '{{ config.test.mount_point }}'
+
+  - name: raw_block_bare_clean
+    run: |
+      # The bare-device test's scratch file had to outlive the unmount.
+      # Remove it now that nvme is rebound, and leave the namespace
+      # unmounted, as homi_stack_down does. The recorded range goes too:
+      # the file system may give those blocks to other data.
+      rm -f /run/homi/raw_range && \
+        '{{ config.test.repo_path }}/tasks/steps/mount_nvme.sh' '{{ config.test.nvme_bdf }}' '{{ config.test.mount_point }}' && \
+        rm -f '{{ config.test.mount_point }}/opends_tests/raw_bare_scratch.bin' && \
+        umount '{{ config.test.mount_point }}'
