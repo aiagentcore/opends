@@ -4,9 +4,13 @@
 Reads the pattern file written by test_sync_read_prep through every mode
 into device memory, copies it back with cudart and compares with a kernel
 read; then writes a scratch file through sync, async and batch and reads it
-back through the kernel. Skips unless OPENDS_BACKEND is aisio,
-OPENDS_HOMI_MNT names the mount and the CUDA libraries load. Runs under
-pytest or on its own, which needs no pytest on the target:
+back through the kernel. With OPENDS_TEST_RAW_BLOCK_DEV (the ublk disk) and
+OPENDS_TEST_RAW_EXTENT ("<offset> <length>" of the pattern file's first extent,
+from tasks/steps/first_extent.py) set, and OPENDS_AISIO_RAW_BLOCK=1, it also
+reads that extent through a raw block handle and writes it back unchanged.
+Skips unless OPENDS_BACKEND is aisio, OPENDS_HOMI_MNT names the mount and the
+CUDA libraries load. Runs under pytest or on its own, which needs no pytest on
+the target:
 
     OPENDS_BACKEND=aisio OPENDS_XAL_SHM=/xal_dev0 \\
         OPENDS_HOMI_MNT=/mnt/datasets PYTHONPATH=. python3 tests/test_aisio_cuda.py
@@ -29,6 +33,8 @@ PAGE = 4096
 MNT = os.environ.get("OPENDS_HOMI_MNT")
 PATTERN = os.path.join(MNT, "opends_tests", "sync_read_pattern.bin") if MNT else None
 SCRATCH = os.path.join(MNT, "opends_tests", "py_write_scratch.bin") if MNT else None
+RAW_DEV = os.environ.get("OPENDS_TEST_RAW_BLOCK_DEV")
+RAW_EXTENT = os.environ.get("OPENDS_TEST_RAW_EXTENT")
 H2D, D2H = 1, 2
 
 
@@ -333,6 +339,67 @@ def check_write_roundtrip(cuda, size):
             os.unlink(SCRATCH)
 
 
+def raw_unavailable():
+    """Why the raw block check cannot run here, or None."""
+    if not RAW_DEV or not RAW_EXTENT:
+        return "OPENDS_TEST_RAW_BLOCK_DEV or OPENDS_TEST_RAW_EXTENT is not set"
+    if os.environ.get("OPENDS_AISIO_RAW_BLOCK", "0") in ("", "0"):
+        return "OPENDS_AISIO_RAW_BLOCK is not set"
+    return None
+
+
+def check_raw_block(cuda, expected):
+    # A raw block handle: file_offset is the byte offset on the namespace, so
+    # the pattern file's first extent reads back at its device offset.
+    dev_off, length = (int(v) for v in RAW_EXTENT.split())
+    n = min(length, len(expected), 16 * PAGE)
+    want = expected[:n]
+    buf = opends.alloc(n)
+    try:
+        with opends.OpenDSFile(RAW_DEV, "r+") as raw:
+            cuda.zero(buf.ptr, n)
+            assert raw.read_sync(buf, size=n, file_offset=dev_off) == n
+            assert cuda.d2h(buf.ptr, n) == want
+
+            # Whole LBAs off a 4-byte boundary in GPU memory: read through
+            # the kernel, here the ublk device.
+            cuda.zero(buf.ptr, PAGE)
+            got = raw.read_sync(buf, size=PAGE - 2, file_offset=dev_off + 1)
+            assert got == PAGE - 2
+            assert cuda.d2h(buf.ptr, PAGE - 2) == want[1 : PAGE - 1]
+
+            cuda.zero(buf.ptr, n)
+            assert raw.read_async(buf, size=n, file_offset=dev_off).result() == n
+            assert cuda.d2h(buf.ptr, n) == want
+
+            cuda.zero(buf.ptr, PAGE)
+            with opends.Batch(1) as batch:
+                batch.submit(
+                    [opends.BatchOp(raw, buf, size=PAGE, file_offset=dev_off + PAGE)]
+                )
+                events = batch.get_status(min_nr=1, timeout=30)
+                assert [ev.status for ev in events] == [opends.Status.COMPLETE]
+                assert events[0].ret == PAGE
+            assert cuda.d2h(buf.ptr, PAGE) == want[PAGE : 2 * PAGE]
+
+            # Write the extent back as it is: the write path runs, the bytes
+            # the file system owns stay the same.
+            cuda.h2d(buf.ptr, want)
+            assert raw.write_sync(buf, size=n, file_offset=dev_off) == n
+            assert raw.write_async(buf, size=n, file_offset=dev_off).result() == n
+            try:
+                raw.write_sync(buf, size=PAGE, file_offset=dev_off + 1)
+            except opends.OpenDSError as exc:
+                assert exc.code is opends.ErrorCode.INVALID_VALUE
+            else:
+                raise AssertionError("a raw write off an LBA boundary was accepted")
+            cuda.zero(buf.ptr, n)
+            assert raw.read_sync(buf, size=n, file_offset=dev_off) == n
+            assert cuda.d2h(buf.ptr, n) == want
+    finally:
+        buf.free()
+
+
 if pytest is not None:
 
     @pytest.fixture(scope="module")
@@ -375,6 +442,12 @@ if pytest is not None:
     def test_write_roundtrip(driver, cuda, expected):
         check_write_roundtrip(cuda, len(expected))
 
+    def test_raw_block(driver, cuda, expected):
+        reason = raw_unavailable()
+        if reason:
+            pytest.skip(reason)
+        check_raw_block(cuda, expected)
+
 
 if __name__ == "__main__":
     reason = unavailable()
@@ -399,4 +472,10 @@ if __name__ == "__main__":
         print("%-18s ok" % "dio_not_set")
         check_write_roundtrip(cuda, len(expected))
         print("%-18s ok" % "write_roundtrip")
+        reason = raw_unavailable()
+        if reason:
+            print("%-18s skipped (%s)" % ("raw_block", reason))
+        else:
+            check_raw_block(cuda, expected)
+            print("%-18s ok" % "raw_block")
     print("all ok")

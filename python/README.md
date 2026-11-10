@@ -222,4 +222,8 @@ the sync, async, stream and batch families and the driver calls.
 `tests/test_aisio_cuda.py` runs the same families against the aisio backend
 on a live HOMI stack and skips unless `OPENDS_BACKEND=aisio` and
 `OPENDS_HOMI_MNT` are set and the CUDA libraries load; `scripts/run_tests.py`
-runs it as the `python` test of the aisio suite.
+runs it as the `python` test of the aisio suite. With
+`OPENDS_AISIO_RAW_BLOCK=1`, `OPENDS_TEST_RAW_BLOCK_DEV` (the ublk disk) and
+`OPENDS_TEST_RAW_EXTENT` set, it also covers a raw block handle: an
+`OpenDSFile` on the block device, opened `"r"` or `"r+"` (the other modes
+create or truncate), whose `file_offset` is the byte offset on the namespace.

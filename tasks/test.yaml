@@ -197,11 +197,19 @@ steps:
 
   - name: test_python_aisio
     run: |
+      # Raw block mode is on for the raw handle check, which reads the
+      # pattern file's first extent through the ublk disk qublk exports. The
+      # two values are fetched first so a failure fails the step: the test
+      # skips the check when they are empty.
       . '{{ config.test.repo_path }}/tasks/steps/install_prefix.sh' '{{ config.deps.install_prefix | default("/usr/local") }}' && \
         cd '{{ config.test.repo_path }}/python' && \
+        raw_dev="$(cat /run/homi/ublk_dev)" && \
+        raw_extent="$(python3 '{{ config.test.repo_path }}/tasks/steps/first_extent.py' '{{ config.test.mount_point }}/opends_tests/sync_read_pattern.bin')" && \
         OPENDS_XAL_SHM=/xal_dev0 \
         OPENDS_HOMI_MNT='{{ config.test.mount_point }}' OPENDS_BACKEND=aisio \
         OPENDS_LIBRARY='{{ config.test.build_dir }}/libopends_aisio.so' \
+        OPENDS_AISIO_RAW_BLOCK=1 OPENDS_TEST_RAW_BLOCK_DEV="$raw_dev" \
+        OPENDS_TEST_RAW_EXTENT="$raw_extent" \
         PYTHONPATH=. python3 tests/test_aisio_cuda.py
 
   - name: test_raw_block_aisio
