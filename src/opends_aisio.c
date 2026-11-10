@@ -192,7 +192,9 @@ struct io_worker {
 struct driver {
 	char dev_uri[XNVME_IDENT_URI_LEN]; ///< NVMe device the HOMI server owns
 	struct aisio_config cfg;           ///< From the environment at open
-	struct xal *xal; ///< Attach to the index xal-server publishes
+	struct xal *xal; ///< The index xal-server publishes; NULL until a
+	                 ///< regular file is registered (index_attach)
+	int attach_rc;   ///< Why the attach failed; it is tried only once
 	struct xnvme_dev *xdev;
 	uint32_t nsid;
 	uint32_t lba_size;
@@ -220,6 +222,7 @@ struct driver {
 	pthread_mutex_t submit_lock;
 	pthread_mutex_t reg_lock;
 	pthread_mutex_t alloc_lock;
+	pthread_mutex_t attach_lock;
 	bool stop;
 };
 
@@ -1087,6 +1090,8 @@ raw_write_allowed(const struct driver *d, const struct file_op *op,
 	return !size || start < op->h->raw_nbytes;
 }
 
+static int index_attach(struct driver *d);
+
 /* Resolve the op's extents and submit it: reads for any handle, writes only
  * for raw handles (a write to a file takes dispatch_write). */
 static void
@@ -1163,7 +1168,8 @@ start_io_op(struct io_worker *w, struct file_op *op)
 	struct ds_extent *extents = &raw_ext;
 	uint32_t extent_count = 1;
 	if (!op->h->raw &&
-	    resolve_extents(d, op->h->fd, &extents, &extent_count) < 0) {
+	    (index_attach(d) < 0 ||
+	     resolve_extents(d, op->h->fd, &extents, &extent_count) < 0)) {
 		op->err = OPENDS_FS_SETUP_ERROR;
 		return;
 	}
@@ -1649,6 +1655,29 @@ xal_attach(struct driver *d)
 	return rc;
 }
 
+/* Attach to the extent index when the first regular file is registered, not
+ * at driver open: a raw block handle needs no index, so a process that
+ * registers only block devices runs without xal-server. attach_lock, not
+ * reg_lock, serializes it: xal_attach can wait a minute for xal-server, and
+ * every op takes reg_lock, so I/O on raw handles would stall meanwhile. A
+ * file handle outlives the driver, so one registered before a close and a
+ * reopen finds no index: start_io_op attaches too before it reads d->xal. A
+ * failed attach is final until the driver is reopened, as it was at driver
+ * open, so later registrations fail at once instead of each waiting a
+ * minute. */
+static int
+index_attach(struct driver *d)
+{
+	int rc;
+
+	pthread_mutex_lock(&d->attach_lock);
+	if (!d->xal && !d->attach_rc)
+		d->attach_rc = xal_attach(d);
+	rc = d->attach_rc;
+	pthread_mutex_unlock(&d->attach_lock);
+	return rc;
+}
+
 /* Ask homi which device it holds; -ENOENT and an empty list mean "not yet". */
 static int
 homi_device(struct driver *d)
@@ -1705,21 +1734,13 @@ opends_driver_open(void)
 	pthread_mutex_init(&d->submit_lock, NULL);
 	pthread_mutex_init(&d->reg_lock, NULL);
 	pthread_mutex_init(&d->alloc_lock, NULL);
-
-	int rc = xal_attach(d);
-	if (rc < 0) {
-		pthread_mutex_destroy(&d->alloc_lock);
-		pthread_mutex_destroy(&d->submit_lock);
-		pthread_mutex_destroy(&d->reg_lock);
-		free(d);
-		return opends_err(OPENDS_FS_SETUP_ERROR);
-	}
+	pthread_mutex_init(&d->attach_lock, NULL);
 
 	drv = d;
 
 	int orc = open_device(d);
 	if (orc < 0) {
-		xal_close(d->xal);
+		pthread_mutex_destroy(&d->attach_lock);
 		pthread_mutex_destroy(&d->alloc_lock);
 		pthread_mutex_destroy(&d->submit_lock);
 		pthread_mutex_destroy(&d->reg_lock);
@@ -1731,7 +1752,7 @@ opends_driver_open(void)
 	if (arc != 0) {
 		fprintf(stderr, "aisio: workers_setup failed\n");
 		xnvme_dev_close(d->xdev);
-		xal_close(d->xal);
+		pthread_mutex_destroy(&d->attach_lock);
 		pthread_mutex_destroy(&d->alloc_lock);
 		pthread_mutex_destroy(&d->submit_lock);
 		pthread_mutex_destroy(&d->reg_lock);
@@ -1761,9 +1782,10 @@ opends_driver_close(void)
 
 	if (drv->xdev)
 		xnvme_dev_close(drv->xdev);
+	if (drv->xal)
+		xal_close(drv->xal);
 
-	xal_close(drv->xal);
-
+	pthread_mutex_destroy(&drv->attach_lock);
 	pthread_mutex_destroy(&drv->alloc_lock);
 	pthread_mutex_destroy(&drv->submit_lock);
 	pthread_mutex_destroy(&drv->reg_lock);
@@ -1890,9 +1912,13 @@ opends_handle_register(opends_handle_t *fh, int fd)
 	struct stat st;
 	if (fstat(fd, &st) < 0)
 		return opends_err(OPENDS_INVALID_VALUE);
+	/* A block device is a raw handle; a regular file needs the index. */
 	bool raw = S_ISBLK(st.st_mode);
 	uint64_t raw_nbytes = 0;
-	if (raw) {
+	if (!raw) {
+		if (index_attach(drv) < 0)
+			return opends_err(OPENDS_FS_SETUP_ERROR);
+	} else {
 		if (!drv->cfg.raw_block_enabled) {
 			fprintf(stderr,
 			        "aisio: fd %d is a block device; set "

@@ -95,7 +95,14 @@ The AiSIO backend reads its configuration from environment variables at
 the open.
 
 - `OPENDS_XAL_SHM`: Shared-memory name of the xal-server extent index.
-  Default `/xal_dev0`.
+  Default `/xal_dev0`. The driver attaches to it when the first regular file
+  is registered, not at open, so a process that registers only block devices
+  (raw block mode, below) needs no xal-server. A file handle kept across
+  `opends_driver_close()` and `opends_driver_open()` attaches at its next
+  I/O, with the same wait and the same error. Registering a file while no
+  index is published fails with `OPENDS_FS_SETUP_ERROR` after a minute of
+  retries; registrations after that fail at once until the driver is closed
+  and opened again.
 - `OPENDS_AISIO_IO_THREADS`: Number of internal IO worker threads. Default 2.
   Driver open creates one NVMe queue per worker.
 - `OPENDS_AISIO_QUEUE_DEPTH`: xNVMe queue depth per worker. Default 8.
@@ -144,7 +151,7 @@ blocks that were allocated at index time usually reads back correctly, but
 XFS does not promise it, and OpenDS does not check it.
 
 To read written data through OpenDS, restart xal-server after the writes so it
-indexes again. A process that opened the driver before the restart stays on the
+indexes again. A process that registered a file before the restart stays on the
 old index: its next read fails with `OPENDS_FS_SETUP_ERROR` after five seconds,
 and it must call `opends_driver_close()` and `opends_driver_open()` to attach to
 the new index. This restriction is temporary: a re-index on request is being
@@ -161,6 +168,12 @@ batch. Regular files can be
 registered on the same driver at the same time. The extent-index restriction
 above does not apply to a raw handle: nothing is looked up, so a raw read sees
 what is on the namespace now.
+
+The minimal stack for raw block mode is `homi serve` and `qublk serve`: no
+file system on the namespace, no mount and no xal-server. This is the
+uGDS-style use, a KV cache for instance, where the process owns the block
+device and lays it out itself. `test_raw_block_bare_aisio` runs that way in
+the test suite.
 
 - Reads follow the alignment rules of a file read (see `opends.h`): any size
   and start, through the kernel (the ublk device) when the whole LBAs would

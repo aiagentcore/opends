@@ -180,6 +180,12 @@ opends_error_t opends_driver_set_max_direct_io_size(size_t max_direct_io_size);
  * ublk disk that is not this namespace), and any block device fd
  * without the variable, fails with OPENDS_INVALID_VALUE. I/O against
  * the access mode of the fd fails the same way.
+ * Registering a regular file attaches the backend to the xal-server
+ * extent index, and fails with OPENDS_FS_SETUP_ERROR when none is
+ * published (the first such registration waits up to a minute for
+ * one); a raw handle needs no index. A file handle kept across
+ * opends_driver_close() and opends_driver_open() attaches at its next
+ * I/O instead.
  */
 opends_error_t opends_handle_register(opends_handle_t *fh, int fd);
 void opends_handle_deregister(opends_handle_t fh);
