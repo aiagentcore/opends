@@ -84,7 +84,9 @@ kernel over the bytes and a copy back on one CUDA stream.
   controller up. The driver joins that group as a secondary and allocates its
   own I/O queues. File extents come from the index xal-server publishes over
   POSIX shared memory, built over the qublk-exported block device. Reads and
-  writes are supported. Requires xNVMe, xal, and the CUDA toolkit.
+  writes are supported. A handle can also be that block device itself (raw
+  block mode, below), with reads and writes as P2P DMA at namespace offsets.
+  Requires xNVMe, xal, and the CUDA toolkit.
 
 ## OpenDS AiSIO configuration
 
@@ -119,6 +121,8 @@ the open.
   every process in the group shares, so xNVMe's 1 GiB default is too large.
 - `OPENDS_AISIO_DEVICE_HEAP_MB`: GPU device heap for this process. Default 0,
   which leaves it at the xNVMe default.
+- `OPENDS_AISIO_RAW_BLOCK`: `1` allows raw block mode (below). Default off:
+  registering a block device fd fails with `OPENDS_INVALID_VALUE`.
 
 ### Writes and the extent index
 
@@ -145,6 +149,42 @@ old index: its next read fails with `OPENDS_FS_SETUP_ERROR` after five seconds,
 and it must call `opends_driver_close()` and `opends_driver_open()` to attach to
 the new index. This restriction is temporary: a re-index on request is being
 pursued in xal-server, and the restriction goes when it lands.
+
+### Raw block mode
+
+With `OPENDS_AISIO_RAW_BLOCK=1`, `opends_handle_register` accepts the
+whole-disk block device qublk exports for the namespace (`/dev/ublkbN`,
+opened with `O_DIRECT`). On such a handle `file_offset` is the byte offset on
+the namespace: `file_offset / lba_size` is the LBA, with no filesystem or
+extent lookup in the path. All I/O families work: sync, async, stream and
+batch. Regular files can be
+registered on the same driver at the same time. The extent-index restriction
+above does not apply to a raw handle: nothing is looked up, so a raw read sees
+what is on the namespace now.
+
+- Reads follow the alignment rules of a file read (see `opends.h`): any size
+  and start, through the kernel (the ublk device) when the whole LBAs would
+  land off a 4-byte boundary in GPU memory, and short at the end of the
+  device.
+- Writes go GPU to NVMe as P2P DMA. They must start and end on an LBA
+  boundary, read from a GPU address on a 4-byte boundary (an NVMe PRP rule;
+  writes have no bounce path) and, unless empty, start before the end of the
+  device; otherwise they fail with `OPENDS_INVALID_VALUE` and nothing is
+  written. Like reads, a write that crosses the end of the device is short.
+- The access mode of the fd holds, though raw I/O never passes the kernel: a
+  write on a read-only fd and a read on a write-only fd fail with
+  `OPENDS_INVALID_VALUE`.
+- Only the ublk disk qublk exports for the namespace this driver opened is
+  accepted. Any other block device is refused, since its offsets are not the
+  namespace's LBAs: another disk, a loop or dm device, a partition (its offset
+  0 is not LBA 0), or another ublk disk. The driver tells its own disk by the
+  NVMe ioctl device qublk serves beside it (`/dev/ublkbN-nvme`), which must
+  report the same controller serial number and namespace id; the sizes must
+  match too. Raw block mode therefore needs that device: qublk built with
+  CUSE, the `cuse` module loaded, and no `--no-cuse`.
+- Raw writes bypass the kernel, homi and xal-server. Do not write to LBAs a
+  mounted filesystem owns: the filesystem and its page cache will not see the
+  change.
 
 ## Performance
 

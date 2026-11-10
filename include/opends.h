@@ -58,6 +58,10 @@
  *   tail may be partial; a violation fails with OPENDS_INVALID_VALUE.
  *   With OPENDS_AISIO_ASSUME_ALIGNED_ONLY set, every read must be
  *   fully LBA-aligned.
+ *   A write to a raw block handle (OPENDS_AISIO_RAW_BLOCK) must start
+ *   and end on an LBA boundary, read from a GPU address on a 4-byte
+ *   boundary and start before the end of the device; one that does not
+ *   fails with OPENDS_INVALID_VALUE and writes nothing.
  */
 #ifndef OPENDS_H_
 #define OPENDS_H_
@@ -167,6 +171,15 @@ opends_error_t opends_driver_set_max_direct_io_size(size_t max_direct_io_size);
  * before it can be used for I/O in any mode. The file must be
  * opened with O_DIRECT. Registration fails with OPENDS_DIO_NOT_SET
  * otherwise. Linux only.
+ *
+ * The aisio backend also accepts the whole-disk ublk device qublk
+ * exports (/dev/ublkbN) when OPENDS_AISIO_RAW_BLOCK=1 (raw block mode):
+ * file_offset is then the byte offset on the NVMe namespace, reads
+ * follow the file read rules, and writes must be LBA-aligned. Any other
+ * block device fd (another disk, a loop or dm device, a partition, a
+ * ublk disk that is not this namespace), and any block device fd
+ * without the variable, fails with OPENDS_INVALID_VALUE. I/O against
+ * the access mode of the fd fails the same way.
  */
 opends_error_t opends_handle_register(opends_handle_t *fh, int fd);
 void opends_handle_deregister(opends_handle_t fh);
