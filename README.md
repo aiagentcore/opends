@@ -220,6 +220,38 @@ _Commit `93fd019` (kernel `6.8.12-dmabuf`, NVMe `Samsung S4LV008[Pascal]`, GPU
 | lmcacheish    | stream |           4991 |           5368 |
 | lmcacheish    | async  |              - |           5384 |
 
+### Raw block mode against files
+
+_Measured 2026-11-10 on the driver of this section (kernel `6.8.12-dmabuf`,
+NVMe `Samsung SSD 990 PRO 1TB`, GPU `NVIDIA RTX PRO 2000 Blackwell`), default
+AiSIO settings. Each leg moves one 2 GiB region; mean of two runs, one with
+the file handle first and one with the raw handle first._
+
+`bench_raw_block_aisio` reads and writes the largest extent of a file through
+a file handle and the same blocks through a raw handle of the ublk device
+(`tasks/bench_raw_block.yaml`, run with `scripts/bench/raw_block.py`; the
+runs below swept chunks of 4 and 16 MiB at queue depths 1 and 8).
+
+| op    | mode   | chunk  | qd | file (MiB/s) | raw (MiB/s) |
+|-------|--------|--------|----|--------------|-------------|
+| read  | sync   |  4 MiB |  1 |         5493 |        5510 |
+| read  | sync   | 16 MiB |  1 |         6616 |        6612 |
+| read  | async  |  4 MiB |  8 |         6952 |        7064 |
+| read  | async  | 16 MiB |  8 |         4917 |        5588 |
+| write | sync   |  4 MiB |  1 |         1014 |        5560 |
+| write | sync   | 16 MiB |  1 |          953 |        6482 |
+| write | async  |  4 MiB |  8 |         3606 |        6613 |
+| write | async  | 16 MiB |  8 |         1291 |        6604 |
+| write | stream |  4 MiB |  8 |         3592 |        6623 |
+
+Reads take the same P2P path either way, so the two handles match. A write to
+a file handle goes through the kernel with a GPU-to-host copy first; a raw
+write is P2P DMA from the GPU. Reads of large chunks at queue depth 8 vary
+from run to run on either handle (the raw 16 MiB async read above was 5157 and
+6020 MiB/s), so read differences in those rows are noise. In the full default
+sweep some read legs also slow down by their position in the run, on whichever
+handle runs there, so compare the handles only over both orders.
+
 ## OpenDS API
 
 | OpenDS family     | cuFile equivalent                    |
